@@ -1,93 +1,119 @@
 ---
 --- Created by kelvins-io.
---- DateTime: 2026/1/10 16:04
+--- DateTime: 2026/1/10 16:05
 ---
 local cjson = require "cjson.safe"
 local redis = require "resty.redis"
 
-local kong = kong
-local type = type
+
+local type         = type
+local time         = ngx.time
 local setmetatable = setmetatable
-local fmt = string.format
-local null = ngx.null
-local unpack = unpack
+local concat       = table.concat
+local tostring     = tostring
+
 
 local _M = {}
 
-local function is_present(str)
-  return str and str ~= "" and str ~= null
-end
 
-local function get_redis_connection(opts)
+-- Redis连接池配置
+local REDIS_POOL_SIZE = 100
+local REDIS_POOL_IDLE_TIMEOUT = 10000  -- 10秒
+local REDIS_CONNECT_TIMEOUT = 1000     -- 1秒
+
+
+--- 获取Redis连接并执行操作
+-- @table self 策略实例
+-- @function callback 回调函数，接收redis客户端作为参数
+-- @return 回调函数的返回值
+local function with_redis_client(self, callback)
   local red = redis:new()
-  red:set_timeout(opts.timeout or 2000)
 
-  local sock_opts = {}
-  sock_opts.ssl = opts.ssl or false
-  sock_opts.ssl_verify = opts.ssl_verify or false
-  sock_opts.server_name = opts.server_name
+  -- 设置超时时间
+  red:set_timeout(self.opts.timeout or REDIS_CONNECT_TIMEOUT)
 
-  -- use a special pool name only if database is set to non-zero
-  -- otherwise use the default pool name host:port
-  if opts.database and opts.database ~= 0 then
-    sock_opts.pool = fmt("%s:%d;%d", opts.host, opts.port, opts.database)
-  end
-
-  local ok, err = red:connect(opts.host, opts.port, sock_opts)
+  -- 连接到Redis服务器
+  local ok, err = red:connect(self.opts.host or "127.0.0.1", self.opts.port or 6379)
   if not ok then
-    kong.log.err("failed to connect to Redis: ", err)
-    return nil, err
+    return nil, "failed to connect to Redis: " .. tostring(err)
   end
 
-  local times, err = red:get_reused_times()
-  if err then
-    kong.log.err("failed to get connect reused times: ", err)
-    return nil, err
-  end
-
-  if times == 0 then
-    if is_present(opts.password) then
-      local ok, err
-      if is_present(opts.username) then
-        ok, err = kong.vault.try(function(cfg)
-          return red:auth(cfg.username, cfg.password)
-        end, opts)
-      else
-        ok, err = kong.vault.try(function(cfg)
-          return red:auth(cfg.password)
-        end, opts)
-      end
-      if not ok then
-        kong.log.err("failed to auth Redis: ", err)
-        return nil, err
-      end
+  -- SSL连接处理
+  if self.opts.ssl then
+    local ssl_ok, ssl_err = red:ssl_handshake(nil, self.opts.server_name, self.opts.ssl_verify)
+    if not ssl_ok then
+      red:close()
+      return nil, "failed to perform SSL handshake: " .. tostring(ssl_err)
     end
+  end
 
-    if opts.database and opts.database ~= 0 then
-      -- Only call select first time, since we know the connection is shared
-      -- between instances that use the same redis database
-      local ok, err = red:select(opts.database)
-      if not ok then
-        kong.log.err("failed to change Redis database: ", err)
-        return nil, err
+  -- 认证处理
+  if self.opts.password then
+    if self.opts.username then
+      -- ACL认证（Redis 6.0+）
+      local auth_ok, auth_err = red:auth(self.opts.username, self.opts.password)
+      if not auth_ok then
+        red:close()
+        return nil, "failed to authenticate with Redis: " .. tostring(auth_err)
+      end
+    else
+      -- 传统密码认证
+      local auth_ok, auth_err = red:auth(self.opts.password)
+      if not auth_ok then
+        red:close()
+        return nil, "failed to authenticate with Redis: " .. tostring(auth_err)
       end
     end
   end
 
-  return red
+  -- 选择数据库
+  if self.opts.database and self.opts.database ~= 0 then
+    local select_ok, select_err = red:select(self.opts.database)
+    if not select_ok then
+      red:close()
+      return nil, "failed to select Redis database: " .. tostring(select_err)
+    end
+  end
+
+  -- 执行回调函数并捕获所有返回值
+  local results = { callback(red) }
+
+  -- 将连接放回连接池
+  local pool_ok, pool_err = red:set_keepalive(REDIS_POOL_IDLE_TIMEOUT, REDIS_POOL_SIZE)
+  if not pool_ok then
+    red:close()
+  end
+
+  -- 返回所有结果（使用table.unpack以兼容Lua 5.2+，LuaJIT也支持）
+  return table.unpack(results)
 end
 
-local function get_key_prefix(opts)
-  return opts.key_prefix or "proxy-cache-advanced:"
+
+--- 构建完整的Redis键名
+-- @table self 策略实例
+-- @string key 缓存键
+-- @return 完整的Redis键名
+local function build_redis_key(self, key)
+  local prefix = self.opts.key_prefix or "proxy-cache-advanced:"
+  return prefix .. key
 end
 
-local function get_full_key(opts, key)
-  return get_key_prefix(opts) .. key
-end
 
---- Create new Redis strategy object
--- @table opts Strategy options: contains Redis connection parameters
+--- 创建新的Redis策略对象
+-- @table opts Redis策略选项，包含host, port, password等配置
 function _M.new(opts)
+  if not opts then
+    return nil, "redis options are required"
+  end
+
+  if not opts.host then
+    return nil, "redis.host is required"
+  end
+
+  if not opts.port then
+    return nil, "redis.port is required"
+  end
+
   local self = {
     opts = opts,
   }
@@ -97,244 +123,177 @@ function _M.new(opts)
   })
 end
 
---- Store a new request entity in Redis
--- @string key The request key
--- @table req_obj The request object, represented as a table containing
---   everything that needs to be cached
--- @int[opt] ttl The TTL for the request; if nil, use default TTL from config
-function _M:store(key, req_obj, req_ttl)
-  local ttl = req_ttl or self.opts.cache_ttl or 300
 
+--- 存储新的请求实体到Redis
+-- @string key 请求键
+-- @table req_obj 请求对象，包含需要缓存的所有内容
+-- @int[opt] req_ttl 请求的TTL（秒）；如果为nil，使用策略实例化时指定的默认TTL
+-- @return true和JSON字符串表示成功，nil和错误信息表示失败
+function _M:store(key, req_obj, req_ttl)
   if type(key) ~= "string" then
     return nil, "key must be a string"
   end
 
-  -- encode request table representation as JSON
+  -- 编码请求表为JSON
   local req_json = cjson.encode(req_obj)
   if not req_json then
     return nil, "could not encode request object"
   end
 
-  local red, err = get_redis_connection(self.opts)
-  if not red then
-    return nil, err or "failed to connect to Redis"
+  -- 构建完整的Redis键名
+  local redis_key = build_redis_key(self, key)
+
+  -- 计算TTL（秒）
+  local ttl = req_ttl or self.opts.ttl
+  if not ttl or ttl <= 0 then
+    ttl = 3600  -- 默认1小时
   end
 
-  local full_key = get_full_key(self.opts, key)
-  local ok, err = red:setex(full_key, ttl, req_json)
-  if not ok then
-    local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-    if not keepalive_ok then
-      kong.log.err("failed to set Redis keepalive: ", keepalive_err)
+  -- 使用Redis连接执行存储操作
+  return with_redis_client(self, function(red)
+    -- 存储到Redis，使用SETEX命令设置键值和过期时间
+    local set_ok, set_err = red:setex(redis_key, ttl, req_json)
+    if not set_ok then
+      return nil, "failed to store in Redis: " .. tostring(set_err)
     end
-    return nil, err or "failed to store in Redis"
-  end
-
-  local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-  if not keepalive_ok then
-    kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-  end
-
-  return ok and req_json or nil, err
+    return true, req_json
+  end)
 end
 
---- Fetch a cached request
--- @string key The request key
--- @return Table representing the request
+
+--- 从Redis获取缓存的请求
+-- @string key 请求键
+-- @return 表示请求的表，或nil和错误信息
 function _M:fetch(key)
   if type(key) ~= "string" then
     return nil, "key must be a string"
   end
 
-  local red, err = get_redis_connection(self.opts)
-  if not red then
-    return nil, err or "failed to connect to Redis"
-  end
+  -- 构建完整的Redis键名
+  local redis_key = build_redis_key(self, key)
 
-  local full_key = get_full_key(self.opts, key)
-  local req_json, err = red:get(full_key)
-  if err then
-    local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-    if not keepalive_ok then
-      kong.log.err("failed to set Redis keepalive: ", keepalive_err)
+  -- 使用Redis连接执行获取操作
+  return with_redis_client(self, function(red)
+    -- 从Redis获取值
+    local req_json, get_err = red:get(redis_key)
+
+    if not req_json or req_json == ngx.null then
+      if not get_err then
+        return nil, "request object not in cache"
+      else
+        return nil, "failed to get from Redis: " .. tostring(get_err)
+      end
     end
-    return nil, err
-  end
 
-  local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-  if not keepalive_ok then
-    kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-  end
+    -- 将JSON解码为表
+    local req_obj = cjson.decode(req_json)
+    if not req_obj then
+      return nil, "could not decode request object"
+    end
 
-  if not req_json or req_json == null then
-    return nil, "request object not in cache"
-  end
-
-  -- decode object from JSON to table
-  local req_obj = cjson.decode(req_json)
-  if not req_obj then
-    return nil, "could not decode request object"
-  end
-
-  return req_obj
+    return req_obj
+  end)
 end
 
---- Purge an entry from the request cache
--- @string key The cache key to purge
--- @return true on success, nil plus error message otherwise
+
+--- 从请求缓存中清除一个条目
+-- @string key 请求键
+-- @return 成功返回true，失败返回nil和错误信息
 function _M:purge(key)
   if type(key) ~= "string" then
     return nil, "key must be a string"
   end
 
-  local red, err = get_redis_connection(self.opts)
-  if not red then
-    return nil, err or "failed to connect to Redis"
-  end
+  -- 构建完整的Redis键名
+  local redis_key = build_redis_key(self, key)
 
-  local full_key = get_full_key(self.opts, key)
-  local ok, err = red:del(full_key)
-  if err then
-    local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-    if not keepalive_ok then
-      kong.log.err("failed to set Redis keepalive: ", keepalive_err)
+  -- 使用Redis连接执行删除操作
+  return with_redis_client(self, function(red)
+    -- 删除键
+    local del_ok, del_err = red:del(redis_key)
+    if not del_ok then
+      return nil, "failed to delete from Redis: " .. tostring(del_err)
     end
-    return nil, err
-  end
-
-  local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-  if not keepalive_ok then
-    kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-  end
-
-  return true
+    return true
+  end)
 end
 
---- Reset TTL for a cached request
--- @string key The cache key
--- @int req_ttl The new TTL
--- @int[opt] timestamp The timestamp to update
+
+--- 重置缓存请求的TTL
+-- @string key 请求键
+-- @int[opt] req_ttl 新的TTL（秒）
+-- @int[opt] timestamp 时间戳；如果为nil，使用当前时间
+-- @return 成功返回true和JSON字符串，失败返回nil和错误信息
 function _M:touch(key, req_ttl, timestamp)
   if type(key) ~= "string" then
     return nil, "key must be a string"
   end
 
-  local red, err = get_redis_connection(self.opts)
-  if not red then
-    return nil, err or "failed to connect to Redis"
-  end
-
-  local full_key = get_full_key(self.opts, key)
-  -- check if entry actually exists
-  local exists, err = red:exists(full_key)
-  if err then
-    local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-    if not keepalive_ok then
-      kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-    end
-    return nil, err
-  end
-
-  if exists == 0 then
-    local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-    if not keepalive_ok then
-      kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-    end
-    return nil, "request object not in cache"
-  end
-
-  -- get the current value
-  local req_json, err = red:get(full_key)
-  if err then
-    local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-    if not keepalive_ok then
-      kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-    end
-    return nil, err
-  end
-
-  if not req_json or req_json == null then
-    local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-    if not keepalive_ok then
-      kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-    end
-    return nil, "request object not in cache"
-  end
-
-  -- decode object from JSON to table
-  local req_obj = cjson.decode(req_json)
+  -- 先获取现有的缓存对象
+  local req_obj, err = self:fetch(key)
   if not req_obj then
-    local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-    if not keepalive_ok then
-      kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-    end
-    return nil, "could not decode request object"
+    return nil, err or "request object not in cache"
   end
 
-  -- refresh timestamp field
-  req_obj.timestamp = timestamp or ngx.time()
+  -- 更新时间戳字段
+  req_obj.timestamp = timestamp or time()
 
-  -- store it again to reset the TTL
-  local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-  if not keepalive_ok then
-    kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-  end
-
-  return _M.store(self, key, req_obj, req_ttl)
+  -- 重新存储以重置TTL
+  return self:store(key, req_obj, req_ttl)
 end
 
---- Marks all entries as expired and remove them from Redis
--- @param free_mem Boolean indicating whether to free the memory; if false,
---   entries will only be marked as expired (not used for Redis)
--- @return true on success, nil plus error message otherwise
+
+--- 将所有条目标记为过期并从Redis中移除
+-- @param free_mem Boolean，指示是否释放内存；如果为false，条目仅被标记为过期
+-- @return 成功返回true，失败返回nil和错误信息
 function _M:flush(free_mem)
-  local red, err = get_redis_connection(self.opts)
-  if not red then
-    return nil, err or "failed to connect to Redis"
-  end
+  -- 构建键前缀模式
+  local prefix = self.opts.key_prefix or "proxy-cache-advanced:"
+  local pattern = prefix .. "*"
 
-  local key_prefix = get_key_prefix(self.opts)
-  -- Use SCAN to find all keys with the prefix and delete them
-  -- This is safer than using KEYS which can block Redis
-  local cursor = "0"
-  local deleted_count = 0
+  -- 使用Redis连接执行清空操作
+  return with_redis_client(self, function(red)
+    -- 使用SCAN命令遍历所有匹配的键（避免阻塞）
+    local cursor = "0"
+    local keys_to_delete = {}
 
-  repeat
-    local result, err = red:scan(cursor, "match", key_prefix .. "*", "count", 100)
-    if err then
-      local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-      if not keepalive_ok then
-        kong.log.err("failed to set Redis keepalive: ", keepalive_err)
+    repeat
+      local scan_result, scan_err = red:scan(cursor, "MATCH", pattern, "COUNT", 100)
+      if not scan_result then
+        return nil, "failed to scan Redis keys: " .. tostring(scan_err)
       end
-      return nil, err
-    end
 
-    if result and type(result) == "table" then
-      cursor = result[1]
-      local keys = result[2]
+      cursor = scan_result[1]
+      local keys = scan_result[2]
 
-      if keys and #keys > 0 then
-        local ok, err = red:del(unpack(keys))
-        if err then
-          local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-          if not keepalive_ok then
-            kong.log.err("failed to set Redis keepalive: ", keepalive_err)
+      -- 收集要删除的键
+      for i = 1, #keys do
+        keys_to_delete[#keys_to_delete + 1] = keys[i]
+      end
+
+      -- 如果收集的键太多，分批删除
+      if #keys_to_delete >= 1000 then
+        if #keys_to_delete > 0 then
+          local del_ok, del_err = red:del(table.unpack(keys_to_delete))
+          if not del_ok then
+            return nil, "failed to delete keys from Redis: " .. tostring(del_err)
           end
-          return nil, err
+          keys_to_delete = {}
         end
-        deleted_count = deleted_count + (ok or 0)
       end
-    else
-      break
+    until cursor == "0"
+
+    -- 删除剩余的键
+    if #keys_to_delete > 0 then
+      local del_ok, del_err = red:del(table.unpack(keys_to_delete))
+      if not del_ok then
+        return nil, "failed to delete keys from Redis: " .. tostring(del_err)
+      end
     end
-  until cursor == "0"
 
-  local keepalive_ok, keepalive_err = red:set_keepalive(10000, 100)
-  if not keepalive_ok then
-    kong.log.err("failed to set Redis keepalive: ", keepalive_err)
-  end
-
-  return true
+    return true
+  end)
 end
+
 
 return _M

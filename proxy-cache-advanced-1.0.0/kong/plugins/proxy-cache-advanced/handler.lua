@@ -28,6 +28,7 @@ local parse_mime_type  = mime_type.parse_mime_type
 local tab_new = require("table.new")
 
 
+local strategies   = require "kong.plugins.proxy-cache-advanced.strategies"
 local STRATEGY_PATH = "kong.plugins.proxy-cache-advanced.strategies"
 local CACHE_VERSION = 1
 local EMPTY = {}
@@ -428,11 +429,6 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
 
   local body = kong.response.get_raw_body()
   if body then
-    local strategy = require(STRATEGY_PATH)({
-      strategy_name = conf.strategy,
-      strategy_opts = conf[conf.strategy],
-    })
-
     local res = {
       status    = kong.response.get_status(),
       headers   = proxy_cache.res_headers,
@@ -447,9 +443,38 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
     local ttl = conf.storage_ttl or conf.cache_control and proxy_cache.res_ttl or
                 conf.cache_ttl
 
-    local ok, err = strategy:store(proxy_cache.cache_key, res, ttl)
-    if not ok then
-      kong.log(err)
+    local strategy_name = conf.strategy
+    local strategy_opts = conf[conf.strategy]
+    local cache_key = proxy_cache.cache_key
+
+    -- 在 body_filter 阶段 Kong 禁止网络 I/O（如 TCP/Redis），仅 memory 等本地策略可同步写缓存
+    if strategies.LOCAL_DATA_STRATEGIES[strategy_name] then
+      local strategy = require(STRATEGY_PATH)({
+        strategy_name = strategy_name,
+        strategy_opts = strategy_opts,
+      })
+      local ok, err = strategy:store(cache_key, res, ttl)
+      if not ok then
+        kong.log(err)
+      end
+    else
+      -- Redis 等需网络 I/O 的策略：推迟到 timer 中执行（timer 阶段允许 TCP）
+      local ok, err = ngx.timer.at(0, function(premature)
+        if premature then
+          return
+        end
+        local strategy = require(STRATEGY_PATH)({
+          strategy_name = strategy_name,
+          strategy_opts = strategy_opts,
+        })
+        local store_ok, store_err = strategy:store(cache_key, res, ttl)
+        if not store_ok then
+          kong.log.err("proxy-cache-advanced redis store: ", store_err)
+        end
+      end)
+      if not ok then
+        kong.log.err("proxy-cache-advanced failed to create timer for cache store: ", err)
+      end
     end
   end
 end
