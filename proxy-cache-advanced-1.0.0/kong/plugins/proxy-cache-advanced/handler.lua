@@ -35,8 +35,7 @@ local EMPTY = {}
 
 
 -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
--- note content-length is not strictly hop-by-hop but we will be
--- adjusting it here anyhow
+-- 注意 content-length 并非严格意义上的逐跳头，但我们仍会在此处调整它
 local hop_by_hop_headers = {
   ["connection"]          = true,
   ["keep-alive"]          = true,
@@ -79,9 +78,8 @@ local function parse_directive_header(h)
       kong.log.err(err)
     end
 
-    -- store the directive token as a numeric value if it looks like a number;
-    -- otherwise, store the string value. for directives without token, we just
-    -- set the key to true
+    -- 若指令令牌看起来像数字，则存储为数值；否则存储字符串值
+    -- 对于没有令牌的指令，我们将键设置为 true
     t[lower(res[1])] = tonumber(res[2]) or res[2] or true
 
     m = iter()
@@ -107,7 +105,7 @@ local function resource_ttl(res_cc)
   if not max_age then
     local expires = ngx.var.sent_http_expires
 
-    -- if multiple Expires headers are present, last one wins
+    -- 若存在多个 Expires 头，最后一个生效
     if type(expires) == "table" then
       expires = expires[#expires]
     end
@@ -123,7 +121,7 @@ end
 
 
 local function cacheable_request(conf, cc)
-  -- TODO refactor these searches to O(1)
+  -- TODO 将这些搜索重构为 O(1) 复杂度
   do
     local method = kong.request.get_method()
     local method_match = false
@@ -139,8 +137,8 @@ local function cacheable_request(conf, cc)
     end
   end
 
-  -- check for explicit disallow directives
-  -- TODO note that no-cache isnt quite accurate here
+  -- 检查显式禁止指令
+  -- TODO 注意 no-cache 在此处并不完全准确
   if conf.cache_control and (cc["no-store"] or cc["no-cache"] or
      ngx.var.authorization) then
     return false
@@ -151,7 +149,7 @@ end
 
 
 local function cacheable_response(conf, cc)
-  -- TODO refactor these searches to O(1)
+  -- TODO 将这些搜索重构为 O(1) 复杂度
   do
     local status = kong.response.get_status()
     local status_match = false
@@ -170,7 +168,7 @@ local function cacheable_response(conf, cc)
   do
     local content_type = ngx.var.sent_http_content_type
 
-    -- bail if we cannot examine this content type
+    -- 若无法检查此内容类型，则退出
     if not content_type or type(content_type) == "table" or
        content_type == "" then
 
@@ -219,7 +217,7 @@ local function cacheable_response(conf, cc)
 end
 
 
--- indicate that we should attempt to cache the response to this request
+-- 指示应尝试缓存此请求的响应
 local function signal_cache_req(ctx, cache_key, cache_status)
   ctx.proxy_cache = {
     cache_key = cache_key,
@@ -236,10 +234,9 @@ local ProxyCacheAdvancedHandler = {
 
 
 function ProxyCacheAdvancedHandler:init_worker()
-  -- catch notifications from other nodes that we purged a cache entry
-  -- only need one worker to handle purges like this
-  -- if/when we introduce inline LRU caching this needs to involve
-  -- worker events as well
+  -- 接收来自其他节点的通知，表示我们已清除某个缓存条目
+  -- 仅需一个 worker 处理此类清除操作
+  -- 如果/当我们引入内联 LRU 缓存时，也需要涉及 worker 事件
   local unpack = unpack
 
   kong.cluster_events:subscribe("proxy-cache-advanced:purge", function(data)
@@ -279,17 +276,18 @@ end
 function ProxyCacheAdvancedHandler:access(conf)
   local cc = req_cc()
 
-  -- if we know this request isnt cacheable, bail out
+  -- 若已知此请求不可缓存，则退出
   if not cacheable_request(conf, cc) then
     kong.response.set_header("X-Cache-Status", "Bypass")
     return
   end
 
+  local ctx = kong.ctx.plugin
   local consumer = kong.client.get_consumer()
   local route = kong.router.get_route()
   local uri = ngx_re_sub(ngx.var.request, "\\?.*", "", "oj")
 
-  -- if we want the cache-key uri only to be lowercase
+  -- 若希望缓存键的 URI 仅为小写
   if conf.ignore_uri_case then
     uri = lower(uri)
   end
@@ -308,27 +306,25 @@ function ProxyCacheAdvancedHandler:access(conf)
 
   kong.response.set_header("X-Cache-Key", cache_key)
 
-  -- try to fetch the cached object from the computed cache key
+  -- 尝试从计算出的缓存键获取缓存对象
   local strategy = require(STRATEGY_PATH)({
     strategy_name = conf.strategy,
     strategy_opts = conf[conf.strategy],
   })
 
-  local ctx = kong.ctx.plugin
   local res, err = strategy:fetch(cache_key)
-  if err == "request object not in cache" then -- TODO make this a utils enum err
+  if err == "request object not in cache" then -- TODO 将其改为 utils 枚举错误
 
-    -- this request wasn't found in the data store, but the client only wanted
-    -- cache data. see https://tools.ietf.org/html/rfc7234#section-5.2.1.7
+    -- 此请求在数据存储中未找到，但客户端仅需要缓存数据
+    -- 参见 https://tools.ietf.org/html/rfc7234#section-5.2.1.7
     if conf.cache_control and cc["only-if-cached"] then
       return kong.response.exit(ngx.HTTP_GATEWAY_TIMEOUT)
     end
 
     ctx.req_body = kong.request.get_raw_body()
 
-    -- this request is cacheable but wasn't found in the data store
-    -- make a note that we should store it in cache later,
-    -- and pass the request upstream
+    -- 此请求可缓存但未在数据存储中找到
+    -- 记录应在稍后将其存入缓存，并将请求传递给上游
     return signal_cache_req(ctx, cache_key)
 
   elseif err then
@@ -342,7 +338,7 @@ function ProxyCacheAdvancedHandler:access(conf)
     return signal_cache_req(ctx, cache_key, "Bypass")
   end
 
-  -- figure out if the client will accept our cache value
+  -- 判断客户端是否会接受我们的缓存值
   if conf.cache_control then
     if cc["max-age"] and time() - res.timestamp > cc["max-age"] then
       return signal_cache_req(ctx, cache_key, "Refresh")
@@ -359,14 +355,14 @@ function ProxyCacheAdvancedHandler:access(conf)
     end
 
   else
-    -- don't serve stale data; res may be stored for up to `conf.storage_ttl` secs
+    -- 不提供过期数据；响应可能已存储最多 `conf.storage_ttl` 秒
     if time() - res.timestamp > conf.cache_ttl then
       return signal_cache_req(ctx, cache_key, "Refresh")
     end
   end
 
-  -- we have cache data yo!
-  -- expose response data for logging plugins
+  -- 我们有缓存数据了！
+  -- 为日志插件暴露响应数据
   local response_data = {
     res = res,
     req = {
@@ -396,18 +392,18 @@ end
 function ProxyCacheAdvancedHandler:header_filter(conf)
   local ctx = kong.ctx.plugin
   local proxy_cache = ctx.proxy_cache
-  -- don't look at our headers if
-  -- a) the request wasn't cacheable, or
-  -- b) the request was served from cache
+  -- 在以下情况下不查看我们的头：
+  -- a) 请求不可缓存，或
+  -- b) 请求已从缓存中提供
   if not proxy_cache then
     return
   end
 
   local cc = res_cc()
 
-  -- if this is a cacheable request, gather the headers and mark it so
+  -- 若这是可缓存请求，收集头信息并标记
   if cacheable_response(conf, cc) then
-    -- TODO: should this use the kong.conf configured limit?
+    -- TODO: 是否应使用 kong.conf 配置的限制？
     proxy_cache.res_headers = resp_get_headers(0, true)
     proxy_cache.res_ttl = conf.cache_control and resource_ttl(cc) or conf.cache_ttl
 
@@ -416,7 +412,7 @@ function ProxyCacheAdvancedHandler:header_filter(conf)
     ctx.proxy_cache = nil
   end
 
-  -- TODO handle Vary header
+  -- TODO 处理 Vary 头
 end
 
 
@@ -429,6 +425,15 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
 
   local body = kong.response.get_raw_body()
   if body then
+    local body_size = #body
+
+    -- 检查响应 body 大小是否超过限制
+    if conf.max_body_size and conf.max_body_size > 0 and body_size > conf.max_body_size then
+      kong.log.debug("response body size (", body_size, " bytes) exceeds max_body_size (", conf.max_body_size, " bytes), skipping cache")
+      ctx.proxy_cache = nil
+      return
+    end
+
     local res = {
       status    = kong.response.get_status(),
       headers   = proxy_cache.res_headers,
@@ -456,6 +461,27 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
       local ok, err = strategy:store(cache_key, res, ttl)
       if not ok then
         kong.log(err)
+      elseif strategy_name == "disk" and ttl and ttl > 0 then
+        -- disk 策略：延时 TTL 后执行清理，删除该缓存文件
+        local delay_sec = ttl
+        local opts = strategy_opts
+        local key = cache_key
+        local timer_ok, timer_err = ngx.timer.at(delay_sec, function(premature)
+          if premature then
+            return
+          end
+          local disk_strategy = require(STRATEGY_PATH)({
+            strategy_name = "disk",
+            strategy_opts = opts,
+          })
+          local purge_ok, purge_err = disk_strategy:purge(key)
+          if not purge_ok then
+            kong.log.err("proxy-cache-advanced disk TTL purge failed: ", purge_err)
+          end
+        end)
+        if not timer_ok then
+          kong.log.err("proxy-cache-advanced failed to create disk TTL purge timer: ", timer_err)
+        end
       end
     else
       -- Redis 等需网络 I/O 的策略：推迟到 timer 中执行（timer 阶段允许 TCP）

@@ -59,6 +59,10 @@ return {
           }},
           { storage_ttl = { description = "Number of seconds to keep resources in the storage backend. This value is independent of `cache_ttl` or resource TTLs defined by Cache-Control behaviors.", type = "integer",
           }},
+          { max_body_size = { description = "Maximum response body size (in bytes) to cache. Responses larger than this value will not be cached. Set to 0 to disable size limit.", type = "integer",
+            default = 0,
+            required = false,
+          }},
           { memory = {
             type = "record",
             fields = {
@@ -81,6 +85,12 @@ return {
               { timeout = { description = "When using the `redis` strategy, this property specifies the timeout in milliseconds of any command submitted to the Redis server.", type = "number", default = 2000 } },
               { database = { description = "When using the `redis` strategy, this property specifies the Redis database to use.", type = "integer", default = 0 } },
               { key_prefix = { description = "When using the `redis` strategy, this property specifies the key prefix for all cache keys stored in Redis.", type = "string", default = "proxy-cache-advanced:" } },
+            },
+          }},
+          { disk = {
+            type = "record",
+            fields = {
+              { path = { description = "When using the `disk` strategy, this property specifies the directory path where cache files are stored. The directory will be created if it does not exist.", type = "string", required = true, default = "/usr/local/kong/tmp/kong-proxy-cache" } },
             },
           }},
           { vary_query_params = { description = "Relevant query parameters considered for the cache key. If undefined, all params are taken into consideration.", type = "array",
@@ -117,6 +127,15 @@ return {
 
           if not config.redis.port then
             return nil, "redis.port is required when using redis strategy"
+          end
+
+        elseif config.strategy == "disk" then
+          if not config.disk then
+            return nil, "disk configuration is required when using disk strategy"
+          end
+
+          if not config.disk.path or config.disk.path == "" then
+            return nil, "disk.path is required when using disk strategy"
           end
         end
 

@@ -3,7 +3,7 @@
 ## 支持插件
 go-log：file-log的go语言实现版   
 go-hello hello版本   
-proxy-cache-avanced 代理缓存高级版(memory+redis策略)   
+proxy-cache-avanced 代理缓存高级版(memory+redis+disk策略)   
 
 ## 构建镜像
 sh docker-build.sh

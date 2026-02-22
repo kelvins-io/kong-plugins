@@ -15,7 +15,8 @@ description = {
 }
 
 dependencies = {
-  "lua >= 5.1"
+  "lua >= 5.1",
+  "luafilesystem >= 1.6"  -- required for disk strategy (flush)
 }
 
 local pluginName = "proxy-cache-advanced"

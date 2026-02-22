@@ -11,13 +11,16 @@ local _M = {}
 _M.STRATEGY_TYPES = {
   "memory",
   "redis",
+  "disk",
 }
 
 -- strategies that store cache data only on the node, instead of
 -- cluster-wide. this is typically used to handle purge notifications
 _M.LOCAL_DATA_STRATEGIES = {
   memory = true,
+  disk   = true,
   [1]    = "memory",
+  [2]    = "disk",
 }
 
 local function require_strategy(name)
