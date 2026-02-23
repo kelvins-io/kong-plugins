@@ -33,6 +33,47 @@ local STRATEGY_PATH = "kong.plugins.proxy-cache-advanced.strategies"
 local CACHE_VERSION = 1
 local EMPTY = {}
 
+-- Redis 等远程策略异步 store 使用 kong.tools.queue（按需加载）
+local Queue
+local function get_queue()
+  if not Queue then
+    Queue = require "kong.tools.queue"
+  end
+  return Queue
+end
+
+-- 供 kong.tools.queue 调用的批量 store 处理函数；成功返回 true，失败返回 false, err
+local function remote_store_handler(handler_conf, entries)
+  local path = handler_conf.STRATEGY_PATH
+  for _, entry in ipairs(entries) do
+    if entry._dummy then
+      -- 占位条目，跳过
+    else
+      local strategy = require(path)({
+        strategy_name = entry.strategy_name,
+        strategy_opts = entry.strategy_opts,
+      })
+      local ok, err = strategy:store(entry.cache_key, entry.res, entry.ttl)
+      if not ok then
+        return false, err
+      end
+    end
+  end
+  return true
+end
+
+-- 根据 conf 构建 queue_conf（Kong 3.4.x kong.tools.queue）
+local function build_queue_conf(conf)
+  local q = get_queue()
+  local queue_conf = q.get_plugin_params("proxy-cache-advanced", conf, "proxy-cache-advanced-store")
+  queue_conf.max_batch_size       = 100
+  queue_conf.max_coalescing_delay = 1
+  queue_conf.max_entries          = 10000
+  queue_conf.max_retry_time       = 60
+  queue_conf.initial_retry_delay  = 0.01
+  queue_conf.max_retry_delay      = 60
+  return queue_conf
+end
 
 -- http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
 -- 注意 content-length 并非严格意义上的逐跳头，但我们仍会在此处调整它
@@ -240,7 +281,7 @@ function ProxyCacheAdvancedHandler:init_worker()
   local unpack = unpack
 
   kong.cluster_events:subscribe("proxy-cache-advanced:purge", function(data)
-    kong.log.err("handling purge of '", data, "'")
+    kong.log.debug("handling purge of '", data, "'")
 
     local plugin_id, cache_key = unpack(utils.split(data, ":"))
     local plugin, err = kong.db.plugins:select({
@@ -484,22 +525,44 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
         end
       end
     else
-      -- Redis 等需网络 I/O 的策略：推迟到 timer 中执行（timer 阶段允许 TCP）
-      local ok, err = ngx.timer.at(0, function(premature)
-        if premature then
-          return
-        end
-        local strategy = require(STRATEGY_PATH)({
+      -- Redis 等需网络 I/O 的策略：优先用 kong.tools.queue 批量写，不可用时回退到 timer
+      local use_timer = true
+      local ok_load, q = pcall(get_queue)
+      if ok_load and q then
+        local queue_conf = build_queue_conf(conf)
+        local handler_conf = { STRATEGY_PATH = STRATEGY_PATH }
+        local ok_enq, err_enq = q.enqueue(queue_conf, remote_store_handler, handler_conf, {
           strategy_name = strategy_name,
           strategy_opts = strategy_opts,
+          cache_key = cache_key,
+          res = res,
+          ttl = ttl,
         })
-        local store_ok, store_err = strategy:store(cache_key, res, ttl)
-        if not store_ok then
-          kong.log.err("proxy-cache-advanced redis store: ", store_err)
+        if ok_enq then
+          use_timer = false
+        else
+          kong.log.warn("proxy-cache-advanced queue enqueue failed, falling back to timer: ", err_enq)
         end
-      end)
-      if not ok then
-        kong.log.err("proxy-cache-advanced failed to create timer for cache store: ", err)
+      else
+        kong.log.warn("proxy-cache-advanced kong.tools.queue not available, using timer: ", q)
+      end
+      if use_timer then
+        local ok, err = ngx.timer.at(0, function(premature)
+          if premature then
+            return
+          end
+          local strategy = require(STRATEGY_PATH)({
+            strategy_name = strategy_name,
+            strategy_opts = strategy_opts,
+          })
+          local store_ok, store_err = strategy:store(cache_key, res, ttl)
+          if not store_ok then
+            kong.log.err("proxy-cache-advanced redis store: ", store_err)
+          end
+        end)
+        if not ok then
+          kong.log.err("proxy-cache-advanced failed to create timer for cache store: ", err)
+        end
       end
     end
   end
