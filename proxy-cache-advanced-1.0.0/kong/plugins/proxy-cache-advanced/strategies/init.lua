@@ -12,6 +12,8 @@ _M.STRATEGY_TYPES = {
   "memory",
   "redis",
   "disk",
+  "tcos",
+  "aoss",
 }
 
 -- strategies that store cache data only on the node, instead of

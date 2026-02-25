@@ -19,7 +19,7 @@ local _M = {}
 -- Redis连接池配置
 local REDIS_POOL_SIZE = 100
 local REDIS_POOL_IDLE_TIMEOUT = 10000  -- 10秒
-local REDIS_CONNECT_TIMEOUT = 1000     -- 1秒
+local REDIS_CONNECT_TIMEOUT = 60000     -- 1秒
 
 
 --- 获取Redis连接并执行操作
@@ -30,7 +30,7 @@ local function with_redis_client(self, callback)
   local red = redis:new()
 
   -- 设置超时时间
-  red:set_timeout(self.opts.timeout or REDIS_CONNECT_TIMEOUT)
+  red:set_timeout(self.opts.timeout * 1000 or REDIS_CONNECT_TIMEOUT)
 
   -- 连接到Redis服务器
   local ok, err = red:connect(self.opts.host or "127.0.0.1", self.opts.port or 6379)

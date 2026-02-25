@@ -3,8 +3,9 @@
 ## 支持插件
 go-log：file-log的go语言实现版   
 go-hello hello版本   
-proxy-cache-avanced 代理缓存高级版(memory+redis+disk策略)   
-
+proxy-cache-avanced 代理缓存高级版(memory+redis+disk+腾讯云tcos+阿里云aoss策略)   
+支持配置防缓存穿透开关+redis-lock策略   
+支持回源逻辑异步在queue处理
 ## 构建镜像
 sh docker-build.sh
 
@@ -22,3 +23,5 @@ redis-gui查看cache-key:result
 ## 交流合作
 可定制化kong网关插件开发   
 1225807604@qq.com，flyingfish_vvip（wechat）
+
+## 赞助列表

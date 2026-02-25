@@ -30,6 +30,7 @@ local tab_new = require("table.new")
 
 local strategies   = require "kong.plugins.proxy-cache-advanced.strategies"
 local STRATEGY_PATH = "kong.plugins.proxy-cache-advanced.strategies"
+local lock_redis   = require "kong.plugins.proxy-cache-advanced.lock_redis"
 local CACHE_VERSION = 1
 local EMPTY = {}
 
@@ -56,6 +57,13 @@ local function remote_store_handler(handler_conf, entries)
       local ok, err = strategy:store(entry.cache_key, entry.res, entry.ttl)
       if not ok then
         return false, err
+      end
+      -- 防击穿锁：store 成功后释放（使用独立 lock_redis 配置）
+      if entry.lock_token and entry.lock_redis_opts then
+        local lock_client = lock_redis.new(entry.lock_redis_opts)
+        if lock_client then
+          lock_client:release_lock(entry.cache_key, entry.lock_token)
+        end
       end
     end
   end
@@ -258,13 +266,71 @@ local function cacheable_response(conf, cc)
 end
 
 
--- 指示应尝试缓存此请求的响应
-local function signal_cache_req(ctx, cache_key, cache_status)
+-- 指示应尝试缓存此请求的响应（lock_token 用于防击穿，store 成功后由 lock_redis 释放）
+local function signal_cache_req(ctx, cache_key, cache_status, lock_token)
   ctx.proxy_cache = {
     cache_key = cache_key,
+    lock_token = lock_token,
   }
 
   kong.response.set_header("X-Cache-Status", cache_status or "Miss")
+end
+
+
+-- 当需要回源时：只要 conf.lock_redis.enable_cache_lock 为真则尝试加锁（使用独立 lock_redis 配置）
+-- 返回 "go" 表示放行上游；返回 "hit", res 表示已从缓存返回，调用方需执行 kong.response.exit(res...)
+-- cc: 请求 Cache-Control 表，用于重试命中时判断是否可返回缓存
+local function try_go_upstream_with_lock(conf, ctx, strategy, cache_key, cache_status, cc)
+  local lock_conf = conf.lock_redis
+  -- 兼容 boolean 与字符串 "true"/"false"（form-urlencoded 等会传成字符串）
+  local use_lock = lock_conf and (lock_conf.enable_cache_lock == true or lock_conf.enable_cache_lock == "true")
+
+  if not use_lock then
+    return "go"
+  end
+
+  local lock_ttl = lock_conf.cache_lock_ttl or 10
+  local retry_count = lock_conf.cache_lock_retry_count or 50
+  local retry_delay = lock_conf.cache_lock_retry_delay or 0.1
+
+  local lock_client, err = lock_redis.new(lock_conf)
+  if not lock_client then
+    kong.log.err("proxy-cache-advanced lock_redis.new failed: ", err)
+    return "go"
+  end
+  local token = lock_client:acquire_lock(cache_key, lock_ttl)
+  if token then
+    -- 当前请求作为回源者，放行上游并在 store 后释放锁
+    return "go", token
+  end
+
+  -- 未抢到锁：等待其他请求回源并写入缓存，重试 fetch
+  for _ = 1, retry_count do
+    ngx.sleep(retry_delay)
+    local res, err = strategy:fetch(cache_key)
+    if not err and res and res.version == CACHE_VERSION then
+      local skip_refresh = true
+      if conf.cache_control and cc then
+        if cc["max-age"] and time() - res.timestamp > cc["max-age"] then
+          skip_refresh = false
+        elseif cc["max-stale"] and time() - res.timestamp - res.ttl > cc["max-stale"] then
+          skip_refresh = false
+        elseif cc["min-fresh"] and res.ttl - (time() - res.timestamp) < cc["min-fresh"] then
+          skip_refresh = false
+        end
+      else
+        if time() - res.timestamp > conf.cache_ttl then
+          skip_refresh = false
+        end
+      end
+      if skip_refresh then
+        return "hit", res
+      end
+    end
+  end
+
+  -- 重试耗尽仍未命中，放行上游（避免无限等待）
+  return "go"
 end
 
 
@@ -364,9 +430,14 @@ function ProxyCacheAdvancedHandler:access(conf)
 
     ctx.req_body = kong.request.get_raw_body()
 
-    -- 此请求可缓存但未在数据存储中找到
-    -- 记录应在稍后将其存入缓存，并将请求传递给上游
-    return signal_cache_req(ctx, cache_key)
+    local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Miss", cc)
+    if action == "hit" then
+      res = token
+      -- 跳转到下方统一缓存命中出口
+    else
+      signal_cache_req(ctx, cache_key, "Miss", token)
+      return
+    end
 
   elseif err then
     kong.log.err(err)
@@ -376,29 +447,57 @@ function ProxyCacheAdvancedHandler:access(conf)
   if res.version ~= CACHE_VERSION then
     kong.log.notice("cache format mismatch, purging ", cache_key)
     strategy:purge(cache_key)
-    return signal_cache_req(ctx, cache_key, "Bypass")
+    local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Bypass", cc)
+    if action == "hit" then
+      res = token
+    else
+      signal_cache_req(ctx, cache_key, "Bypass", token)
+      return
+    end
   end
 
   -- 判断客户端是否会接受我们的缓存值
   if conf.cache_control then
     if cc["max-age"] and time() - res.timestamp > cc["max-age"] then
-      return signal_cache_req(ctx, cache_key, "Refresh")
+      local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
+      if action == "hit" then
+        res = token
+      else
+        signal_cache_req(ctx, cache_key, "Refresh", token)
+        return
+      end
     end
 
-    if cc["max-stale"] and time() - res.timestamp - res.ttl > cc["max-stale"]
-    then
-      return signal_cache_req(ctx, cache_key, "Refresh")
+    if cc["max-stale"] and time() - res.timestamp - res.ttl > cc["max-stale"] then
+      local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
+      if action == "hit" then
+        res = token
+      else
+        signal_cache_req(ctx, cache_key, "Refresh", token)
+        return
+      end
     end
 
-    if cc["min-fresh"] and res.ttl - (time() - res.timestamp) < cc["min-fresh"]
-    then
-      return signal_cache_req(ctx, cache_key, "Refresh")
+    if cc["min-fresh"] and res.ttl - (time() - res.timestamp) < cc["min-fresh"] then
+      local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
+      if action == "hit" then
+        res = token
+      else
+        signal_cache_req(ctx, cache_key, "Refresh", token)
+        return
+      end
     end
 
   else
     -- 不提供过期数据；响应可能已存储最多 `conf.storage_ttl` 秒
     if time() - res.timestamp > conf.cache_ttl then
-      return signal_cache_req(ctx, cache_key, "Refresh")
+      local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
+      if action == "hit" then
+        res = token
+      else
+        signal_cache_req(ctx, cache_key, "Refresh", token)
+        return
+      end
     end
   end
 
@@ -464,37 +563,45 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
     return
   end
 
-  local body = kong.response.get_raw_body()
-  if body then
-    local body_size = #body
+  -- 与官方 proxy-cache 一致：按 chunk 累积，仅在 eof 时写缓存并释放锁，避免分块响应下多次 store/重复释放
+  local chunk = ngx.arg[1]
+  local eof = ngx.arg[2]
+  proxy_cache.res_body = (proxy_cache.res_body or "") .. (chunk or "")
 
-    -- 检查响应 body 大小是否超过限制
-    if conf.max_body_size and conf.max_body_size > 0 and body_size > conf.max_body_size then
-      kong.log.debug("response body size (", body_size, " bytes) exceeds max_body_size (", conf.max_body_size, " bytes), skipping cache")
-      ctx.proxy_cache = nil
-      return
-    end
+  if not eof then
+    return
+  end
 
-    local res = {
-      status    = kong.response.get_status(),
-      headers   = proxy_cache.res_headers,
-      body      = body,
-      body_len  = #body,
-      timestamp = time(),
-      ttl       = proxy_cache.res_ttl,
-      version   = CACHE_VERSION,
-      req_body  = ctx.req_body,
-    }
+  local body = proxy_cache.res_body
+  local body_size = #body
 
-    local ttl = conf.storage_ttl or conf.cache_control and proxy_cache.res_ttl or
-                conf.cache_ttl
+  -- 检查响应 body 大小是否超过限制
+  if conf.max_body_size and conf.max_body_size > 0 and body_size > conf.max_body_size then
+    kong.log.debug("response body size (", body_size, " bytes) exceeds max_body_size (", conf.max_body_size, " bytes), skipping cache")
+    ctx.proxy_cache = nil
+    return
+  end
 
-    local strategy_name = conf.strategy
-    local strategy_opts = conf[conf.strategy]
-    local cache_key = proxy_cache.cache_key
+  local res = {
+    status    = kong.response.get_status(),
+    headers   = proxy_cache.res_headers,
+    body      = body,
+    body_len  = body_size,
+    timestamp = time(),
+    ttl       = proxy_cache.res_ttl,
+    version   = CACHE_VERSION,
+    req_body  = ctx.req_body,
+  }
 
-    -- 在 body_filter 阶段 Kong 禁止网络 I/O（如 TCP/Redis），仅 memory 等本地策略可同步写缓存
-    if strategies.LOCAL_DATA_STRATEGIES[strategy_name] then
+  local ttl = conf.storage_ttl or conf.cache_control and proxy_cache.res_ttl or
+              conf.cache_ttl
+
+  local strategy_name = conf.strategy
+  local strategy_opts = conf[conf.strategy]
+  local cache_key = proxy_cache.cache_key
+
+  -- 在 body_filter 阶段 Kong 禁止网络 I/O（如 TCP/Redis），仅 memory 等本地策略可同步写缓存
+  if strategies.LOCAL_DATA_STRATEGIES[strategy_name] then
       local strategy = require(STRATEGY_PATH)({
         strategy_name = strategy_name,
         strategy_opts = strategy_opts,
@@ -537,6 +644,8 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
           cache_key = cache_key,
           res = res,
           ttl = ttl,
+          lock_token = proxy_cache.lock_token,
+          lock_redis_opts = proxy_cache.lock_token and conf.lock_redis or nil,
         })
         if ok_enq then
           use_timer = false
@@ -547,6 +656,8 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
         kong.log.warn("proxy-cache-advanced kong.tools.queue not available, using timer: ", q)
       end
       if use_timer then
+        local lock_token = proxy_cache.lock_token
+        local lock_redis_opts = (proxy_cache.lock_token and conf.lock_redis) or nil
         local ok, err = ngx.timer.at(0, function(premature)
           if premature then
             return
@@ -558,6 +669,11 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
           local store_ok, store_err = strategy:store(cache_key, res, ttl)
           if not store_ok then
             kong.log.err("proxy-cache-advanced redis store: ", store_err)
+          elseif lock_token and lock_redis_opts then
+            local lock_client = lock_redis.new(lock_redis_opts)
+            if lock_client then
+              lock_client:release_lock(cache_key, lock_token)
+            end
           end
         end)
         if not ok then
@@ -566,7 +682,6 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
       end
     end
   end
-end
 
 
 return ProxyCacheAdvancedHandler
