@@ -610,26 +610,26 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
       if not ok then
         kong.log(err)
       elseif strategy_name == "disk" and ttl and ttl > 0 then
-        -- disk 策略：延时 TTL 后执行清理，删除该缓存文件
-        local delay_sec = ttl
-        local opts = strategy_opts
-        local key = cache_key
-        local timer_ok, timer_err = ngx.timer.at(delay_sec, function(premature)
-          if premature then
-            return
-          end
-          local disk_strategy = require(STRATEGY_PATH)({
-            strategy_name = "disk",
-            strategy_opts = opts,
-          })
-          local purge_ok, purge_err = disk_strategy:purge(key)
-          if not purge_ok then
-            kong.log.err("proxy-cache-advanced disk TTL purge failed: ", purge_err)
-          end
-        end)
-        if not timer_ok then
-          kong.log.err("proxy-cache-advanced failed to create disk TTL purge timer: ", timer_err)
-        end
+        -- disk 策略：延时 TTL 后执行清理，删除该缓存文件，推荐单独程序定期扫描删除
+        --local delay_sec = ttl
+        --local opts = strategy_opts
+        --local key = cache_key
+        --local timer_ok, timer_err = ngx.timer.at(delay_sec, function(premature)
+        --  if premature then
+        --    return
+        --  end
+        --  local disk_strategy = require(STRATEGY_PATH)({
+        --    strategy_name = "disk",
+        --    strategy_opts = opts,
+        --  })
+        --  local purge_ok, purge_err = disk_strategy:purge(key)
+        --  if not purge_ok then
+        --    kong.log.err("proxy-cache-advanced disk TTL purge failed: ", purge_err)
+        --  end
+        --end)
+        --if not timer_ok then
+        --  kong.log.err("proxy-cache-advanced failed to create disk TTL purge timer: ", timer_err)
+        --end
       end
     else
       -- Redis 等需网络 I/O 的策略：优先用 kong.tools.queue 批量写，不可用时回退到 timer
