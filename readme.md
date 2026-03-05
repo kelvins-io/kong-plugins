@@ -4,7 +4,8 @@
 go-log：file-log的go语言实现版   
 go-hello hello版本   
 proxy-cache-advanced 代理缓存高级版(memory+redis+disk+腾讯云tcos+阿里云aoss策略)     
-grpc-web-advanced grpc-web高级版本 浏览器可跨域http->grpc   
+grpc-web-advanced grpc-web高级版本 浏览器可跨域http->grpc，可挂载远程proto文件   
+grpc-gateway-advanced grpc-gateway高级版,可挂载远程proto文件   
 
 ## 构建镜像
 sh docker-build.sh
