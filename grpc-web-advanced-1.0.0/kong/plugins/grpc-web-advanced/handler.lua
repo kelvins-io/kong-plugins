@@ -2,7 +2,6 @@
 
 local deco = require "kong.plugins.grpc-web-advanced.deco"
 local proto_loader = require "kong.plugins.grpc-web-advanced.proto_loader"
-local kong_meta = require "kong.meta"
 
 local ngx = ngx
 local kong = kong
@@ -22,13 +21,13 @@ local kong_service_request_set_header = kong.service.request.set_header
 local kong_service_request_set_raw_body = kong.service.request.set_raw_body
 
 
-local grpc_web = {
+local grpc_web_advanced = {
   PRIORITY = 3,
-  VERSION = kong_meta.version,
+  VERSION = "1.0.0",
 }
 
 
-function grpc_web:init_worker()
+function grpc_web_advanced:init_worker()
   kong.cluster_events:subscribe("grpc-web-advanced:proto-cache-purge", function(payload)
     kong.log.debug("handling proto cache purge: ", payload)
 
@@ -77,7 +76,7 @@ local CORS_HEADERS = {
   ["Access-Control-Allow-Headers"] = "content-type,x-grpc-web,x-user-agent",
 }
 
-function grpc_web:access(conf)
+function grpc_web_advanced:access(conf)
   kong_response_set_header("Access-Control-Allow-Origin", conf.allow_origin_header)
 
   if kong_request_get_method() == "OPTIONS" then
@@ -117,7 +116,7 @@ function grpc_web:access(conf)
 end
 
 
-function grpc_web:header_filter(conf)
+function grpc_web_advanced:header_filter(conf)
   if kong_request_get_method() == "OPTIONS" then
     return
   end
@@ -129,7 +128,7 @@ function grpc_web:header_filter(conf)
 end
 
 
-function grpc_web:body_filter(conf)
+function grpc_web_advanced:body_filter(conf)
   if kong_request_get_method() ~= "POST" then
     return
   end
@@ -153,4 +152,4 @@ function grpc_web:body_filter(conf)
 end
 
 
-return grpc_web
+return grpc_web_advanced

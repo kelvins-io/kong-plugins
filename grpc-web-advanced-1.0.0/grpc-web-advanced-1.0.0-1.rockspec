@@ -26,6 +26,7 @@ build = {
   modules = {
     ["kong.plugins."..pluginName..".handler"] = "kong/plugins/"..pluginName.."/handler.lua",
     ["kong.plugins."..pluginName..".schema"] = "kong/plugins/"..pluginName.."/schema.lua",
+    ["kong.plugins."..pluginName..".deco"] = "kong/plugins/"..pluginName.."/deco.lua",
     ["kong.plugins."..pluginName..".proto_loader"] = "kong/plugins/"..pluginName.."/proto_loader.lua",
     ["kong.plugins."..pluginName..".api"] = "kong/plugins/"..pluginName.."/api.lua",
   }
