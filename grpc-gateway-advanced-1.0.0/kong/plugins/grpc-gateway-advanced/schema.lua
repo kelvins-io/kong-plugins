@@ -31,6 +31,14 @@ return {
             default = 10,
           },
         },
+        {
+          proto_ssl_verify = {
+            description = "When proto is a remote HTTPS URL, whether to verify the TLS certificate. Default: false.",
+            type = "boolean",
+            required = false,
+            default = false,
+          },
+        },
       },
     }, },
   },

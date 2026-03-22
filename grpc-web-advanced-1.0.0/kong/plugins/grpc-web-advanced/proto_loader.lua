@@ -61,8 +61,11 @@ local function get_cache_root(conf)
 end
 
 --- 从远程 URL 拉取内容并写入缓存文件
-local function fetch_and_cache(url, cache_path, timeout_ms)
+local function fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
   timeout_ms = timeout_ms or DEFAULT_HTTP_TIMEOUT_MS
+  if ssl_verify == nil then
+    ssl_verify = true
+  end
   local httpc = http:new()
   if not httpc then
     return nil, "failed to create http client"
@@ -71,7 +74,7 @@ local function fetch_and_cache(url, cache_path, timeout_ms)
 
   local res, err = httpc:request_uri(url, {
     method = "GET",
-    ssl_verify = true,
+    ssl_verify = ssl_verify,
   })
 
   if err then
@@ -101,7 +104,7 @@ end
 ---
 --- 解析 proto 配置，返回可供 grpc_tools 使用的本地文件路径。
 --- @param proto string 本地路径或远程 URL（http/https）
---- @param conf table 插件配置（可选，用于 proto_cache_dir / proto_fetch_timeout）
+--- @param conf table 插件配置（可选，用于 proto_cache_dir / proto_fetch_timeout / proto_fetch_ssl_verify）
 --- @return string|nil 本地 .proto 文件路径
 --- @return string|nil 失败时的错误信息
 ---
@@ -127,13 +130,18 @@ function _M.resolve_proto(proto, conf)
     and (conf.proto_fetch_timeout * 1000)
     or DEFAULT_HTTP_TIMEOUT_MS
 
+  local ssl_verify = true
+  if conf and conf.proto_fetch_ssl_verify ~= nil then
+    ssl_verify = conf.proto_fetch_ssl_verify
+  end
+
   -- 若缓存文件已存在则直接使用（不在此处做 TTL 过期，由上层或运维清理缓存目录）
   local attr = lfs.attributes(cache_path)
   if attr and attr.mode == "file" then
     return cache_path
   end
 
-  return fetch_and_cache(proto, cache_path, timeout_ms)
+  return fetch_and_cache(proto, cache_path, timeout_ms, ssl_verify)
 end
 
 ---

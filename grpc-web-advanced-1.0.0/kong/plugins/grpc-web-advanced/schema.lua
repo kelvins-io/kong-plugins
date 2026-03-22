@@ -26,6 +26,12 @@ return {
           },
         },
         {
+          proto_fetch_ssl_verify = { description = "When proto is an https:// URL, whether to verify the remote TLS certificate. Default: true.", type = "boolean",
+            required = false,
+            default = false,
+          },
+        },
+        {
           pass_stripped_path = { description = "If set to `true` causes the plugin to pass the stripped request path to the upstream gRPC service.", type = "boolean",
             required = false,
           },
