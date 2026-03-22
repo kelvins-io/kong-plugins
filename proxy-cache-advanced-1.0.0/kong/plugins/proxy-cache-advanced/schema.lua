@@ -59,8 +59,8 @@ return {
           }},
           { storage_ttl = { description = "Number of seconds to keep resources in the storage backend. This value is independent of `cache_ttl` or resource TTLs defined by Cache-Control behaviors.", type = "integer",
           }},
-          { max_body_size = { description = "Maximum response body size (in bytes) to cache. Responses larger than this value will not be cached. Set to 0 to disable size limit.", type = "integer",
-            default = 0,
+          { max_body_size = { description = "Maximum response body size (in bytes) to cache. Responses larger than this value will not be cached. Default is 5 MiB (5242880). Set to 0 to disable size limit.", type = "integer",
+            default = 5242880,
             required = false,
           }},
           { lock_redis = {
