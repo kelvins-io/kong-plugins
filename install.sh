@@ -12,3 +12,7 @@ cd -
 cd grpc-gateway-advanced-1.0.0
 luarocks make
 cd -
+
+cd response-gzip-1.0.0
+luarocks make
+cd -
