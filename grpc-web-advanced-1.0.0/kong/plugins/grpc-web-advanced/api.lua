@@ -8,9 +8,10 @@ local kong = kong
 
 local CLUSTER_EVENT = "grpc-web-advanced:proto-cache-purge"
 
-local function broadcast_purge(payload)
-  kong.log.debug("broadcasting proto cache purge: ", payload)
-  return kong.cluster_events:broadcast(CLUSTER_EVENT, payload)
+--- @param plugin_id string grpc-web-advanced 插件实例 ID（UUID）
+local function broadcast_purge(plugin_id)
+  kong.log.debug("broadcasting proto cache purge for plugin: ", plugin_id)
+  return kong.cluster_events:broadcast(CLUSTER_EVENT, plugin_id)
 end
 
 local function each_grpc_web_advanced_plugin()
@@ -53,9 +54,11 @@ return {
         end
       end
 
-      local ok, err = broadcast_purge("all")
-      if not ok then
-        kong.log.err("failed broadcasting proto cache purge to cluster: ", err)
+      for plugin in each_grpc_web_advanced_plugin() do
+        local ok, err = broadcast_purge(plugin.id)
+        if not ok then
+          kong.log.err("failed broadcasting proto cache purge to cluster: ", err)
+        end
       end
 
       return kong.response.exit(200, {

@@ -2,6 +2,7 @@
 
 local deco = require "kong.plugins.grpc-web-advanced.deco"
 local proto_loader = require "kong.plugins.grpc-web-advanced.proto_loader"
+local kong_meta = require "kong.meta"
 
 local ngx = ngx
 local kong = kong
@@ -23,48 +24,31 @@ local kong_service_request_set_raw_body = kong.service.request.set_raw_body
 
 local grpc_web_advanced = {
   PRIORITY = 3,
-  VERSION = "1.0.0",
+  VERSION = kong_meta.version,
 }
 
 
 function grpc_web_advanced:init_worker()
-  kong.cluster_events:subscribe("grpc-web-advanced:proto-cache-purge", function(payload)
-    kong.log.debug("handling proto cache purge: ", payload)
+  kong.cluster_events:subscribe("grpc-web-advanced:proto-cache-purge", function(plugin_id)
+    kong.log.debug("handling proto cache purge for plugin: ", plugin_id)
 
-    local seen = {}
-    local total = 0
-    local iter = kong.db.plugins:each()
-
-    while true do
-      local plugin, err = iter()
-      if err then
-        kong.log.err("proto cache purge: iter error: ", err)
-        return
-      end
-      if not plugin then
-        break
-      end
-      if plugin.name ~= "grpc-web-advanced" then
-        goto continue
-      end
-      if payload ~= "all" and payload ~= plugin.id then
-        goto continue
-      end
-
-      local cache_dir = proto_loader.get_cache_root(plugin.config)
-      if not seen[cache_dir] then
-        seen[cache_dir] = true
-        local count, purge_err = proto_loader.purge_cache_dir(cache_dir)
-        if purge_err then
-          kong.log.err("proto cache purge failed: ", purge_err)
-        else
-          total = total + (count or 0)
-        end
-      end
-      ::continue::
+    local plugin, err = kong.db.plugins:select({ id = plugin_id })
+    if err then
+      kong.log.err("proto cache purge: select error: ", err)
+      return
+    end
+    if not plugin or plugin.name ~= "grpc-web-advanced" then
+      return
     end
 
-    kong.log.info("proto cache purge: deleted ", total, " file(s) on this node")
+    local cache_dir = proto_loader.get_cache_root(plugin.config)
+    local count, purge_err = proto_loader.purge_cache_dir(cache_dir)
+    if purge_err then
+      kong.log.err("proto cache purge failed: ", purge_err)
+      return
+    end
+
+    kong.log.info("proto cache purge: deleted ", count or 0, " file(s) on this node")
   end)
 end
 

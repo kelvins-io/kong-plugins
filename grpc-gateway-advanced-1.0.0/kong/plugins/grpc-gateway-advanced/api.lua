@@ -8,9 +8,13 @@ local kong = kong
 
 local CLUSTER_EVENT = "grpc-gateway-advanced:proto-cache-purge"
 
-local function broadcast_purge(payload)
-  kong.log.debug("broadcasting proto cache purge: ", payload)
-  return kong.cluster_events:broadcast(CLUSTER_EVENT, payload)
+--- @param plugin_id string 单个 grpc-gateway-advanced 插件实例的 UUID（不支持 "all" 等聚合值）
+local function broadcast_purge(plugin_id)
+  if type(plugin_id) ~= "string" or plugin_id == "" or plugin_id == "all" then
+    return false, "plugin_id must be a single plugin UUID"
+  end
+  kong.log.debug("broadcasting proto cache purge: ", plugin_id)
+  return kong.cluster_events:broadcast(CLUSTER_EVENT, plugin_id)
 end
 
 local function each_grpc_gateway_advanced_plugin()
@@ -40,11 +44,13 @@ return {
     DELETE = function()
       local seen = {}
       local total = 0
+      local broadcast_ids = {}
 
       for plugin in each_grpc_gateway_advanced_plugin() do
         local cache_dir = proto_loader.get_cache_root(plugin.config)
         if not seen[cache_dir] then
           seen[cache_dir] = true
+          table.insert(broadcast_ids, plugin.id)
           local count, err = proto_loader.purge_cache_dir(cache_dir)
           if err then
             return kong.response.exit(500, { message = err })
@@ -53,9 +59,11 @@ return {
         end
       end
 
-      local ok, err = broadcast_purge("all")
-      if not ok then
-        kong.log.err("failed broadcasting proto cache purge to cluster: ", err)
+      for _, pid in ipairs(broadcast_ids) do
+        local ok, err = broadcast_purge(pid)
+        if not ok then
+          kong.log.err("failed broadcasting proto cache purge to cluster: ", err)
+        end
       end
 
       return kong.response.exit(200, {
