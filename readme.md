@@ -1,7 +1,7 @@
 ## kong 插件集合集成
 可以挂载到kong route service consumer
 
-## 在线体验
+## 在线体验（链接可能失效）
 konga面板   
 http://51pd9106ao09.vicp.fun:49462      
 web接入   
@@ -15,8 +15,8 @@ https://51pd9106ao09.vicp.fun/add
 go-log：file-log的go语言实现版   
 go-hello hello版本   
 proxy-cache-advanced 代理缓存高级版(memory+redis+disk+腾讯云tcos+阿里云aoss策略)     
-grpc-web-advanced grpc-web高级版本 浏览器可跨域http->grpc，可挂载远程proto文件   
-grpc-gateway-advanced grpc-gateway高级版,可挂载远程proto文件   
+grpc-web-advanced grpc-web高级版本 浏览器可跨域http->grpc，可挂载远程proto文件，同节点多个worker共享proto缓存   
+grpc-gateway-advanced grpc-gateway高级版,可挂载远程proto文件，同节点多个worker共享proto缓存   
 response-gzip gzip响应插件，支持配置gzip压缩级别和最小压缩长度
 ## 构建镜像
 sh docker-build.sh

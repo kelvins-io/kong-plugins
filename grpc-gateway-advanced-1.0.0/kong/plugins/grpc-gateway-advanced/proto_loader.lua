@@ -5,16 +5,19 @@
 
 local http = require "resty.http"
 local lfs = require "lfs"
-local kong = kong
+local resty_lock = require "resty.lock"
 local sub = string.sub
 local format = string.format
 local gsub = string.gsub
 local match = string.match
+local ceil = math.ceil
 
 
 -- 默认缓存目录（可被 schema 中的 proto_cache_dir 覆盖）
-local DEFAULT_CACHE_DIR = "/usr/local/kong/tmp/proto_cache"
+local DEFAULT_CACHE_DIR = "/usr/local/kong/proto_cache"
 local DEFAULT_HTTP_TIMEOUT_MS = 10000
+local LOCK_PREFIX = "grpc-gateway-advanced:proto:"
+local WAIT_POLL_INTERVAL = 0.05
 
 local _M = {}
 
@@ -51,6 +54,22 @@ local function ensure_dir(path)
   return nil, err
 end
 
+local function cache_file_exists(cache_path)
+  local attr = lfs.attributes(cache_path)
+  return attr and attr.mode == "file"
+end
+
+--- 获取 Kong 节点上可用的 lock shared dict 名称
+local function get_lock_dict_name()
+  if ngx.shared.kong_locks then
+    return "kong_locks"
+  end
+  if ngx.shared.stream_kong_locks then
+    return "stream_kong_locks"
+  end
+  return nil
+end
+
 --- 获取缓存根目录：使用配置项或默认路径
 local function get_cache_root(conf)
   local root = conf and conf.proto_cache_dir
@@ -60,8 +79,8 @@ local function get_cache_root(conf)
   return DEFAULT_CACHE_DIR
 end
 
---- 从远程 URL 拉取内容并写入缓存文件（HTTPS 时 ssl_verify 由调用方传入，默认不校验证书）
-local function fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
+--- 从远程 URL 拉取 proto 内容
+local function fetch_proto_body(url, timeout_ms, ssl_verify)
   timeout_ms = timeout_ms or DEFAULT_HTTP_TIMEOUT_MS
   ssl_verify = (ssl_verify == true)
   local httpc = http:new()
@@ -90,13 +109,97 @@ local function fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
     return nil, "fetch proto: empty body"
   end
 
-  local file, err = io.open(cache_path, "wb")
+  return body
+end
+
+--- 原子写入缓存文件，避免并发读者读到半写内容
+local function write_cache_atomic(cache_path, body)
+  local tmp_path = format("%s.tmp.%s.%s", cache_path, ngx.worker.pid(), ngx.now())
+
+  local file, err = io.open(tmp_path, "wb")
   if not file then
     return nil, "write cache failed: " .. tostring(err)
   end
   file:write(body)
   file:close()
-  return cache_path
+
+  local ok, rerr = os.rename(tmp_path, cache_path)
+  if ok then
+    return cache_path
+  end
+
+  os.remove(tmp_path)
+  if cache_file_exists(cache_path) then
+    return cache_path
+  end
+  return nil, "write cache failed: " .. tostring(rerr)
+end
+
+--- 从远程 URL 拉取内容并写入缓存文件（HTTPS 时 ssl_verify 由调用方传入，默认不校验证书）
+local function fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
+  local body, err = fetch_proto_body(url, timeout_ms, ssl_verify)
+  if not body then
+    return nil, err
+  end
+  return write_cache_atomic(cache_path, body)
+end
+
+--- 等待其他协程/worker 完成下载
+local function wait_for_cache(cache_path, timeout_ms)
+  local deadline = ngx.now() + timeout_ms / 1000
+  while ngx.now() < deadline do
+    if cache_file_exists(cache_path) then
+      return cache_path
+    end
+    ngx.sleep(WAIT_POLL_INTERVAL)
+  end
+  return nil, "timeout waiting for proto cache"
+end
+
+--- 在分布式锁保护下解析远程 proto，同一 URL 在同一节点只触发一次下载
+local function resolve_remote_proto(url, cache_path, timeout_ms, ssl_verify)
+  if cache_file_exists(cache_path) then
+    return cache_path
+  end
+
+  local dict_name = get_lock_dict_name()
+  if not dict_name then
+    ngx.log(ngx.WARN, "proto cache lock dict unavailable, fetching without deduplication")
+    return fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
+  end
+
+  local lock, err = resty_lock:new(dict_name)
+  if not lock then
+    ngx.log(ngx.WARN, "failed to create proto cache lock: ", err)
+    return fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
+  end
+
+  local lock_key = LOCK_PREFIX .. ngx.md5(cache_path)
+  local lock_wait = ceil(timeout_ms / 1000) + 5
+  local lock_hold = lock_wait + 5
+
+  local elapsed, lerr = lock:lock(lock_key, lock_wait, { exptime = lock_hold })
+  if not elapsed then
+    local path, werr = wait_for_cache(cache_path, timeout_ms)
+    if path then
+      return path
+    end
+    return nil, werr or ("proto cache lock failed: " .. tostring(lerr))
+  end
+
+  local path, ferr
+  if cache_file_exists(cache_path) then
+    path = cache_path
+  else
+    path, ferr = fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
+  end
+
+  local ok, uerr = lock:unlock()
+  if not ok then
+    ngx.log(ngx.WARN, "failed to unlock proto cache lock: ", uerr)
+  end
+
+  return path, ferr
 end
 
 ---
@@ -131,12 +234,11 @@ function _M.resolve_proto(proto, conf)
   local ssl_verify = conf and conf.proto_ssl_verify == true
 
   -- 若缓存文件已存在则直接使用（不在此处做 TTL 过期，由上层或运维清理缓存目录）
-  local attr = lfs.attributes(cache_path)
-  if attr and attr.mode == "file" then
+  if cache_file_exists(cache_path) then
     return cache_path
   end
 
-  return fetch_and_cache(proto, cache_path, timeout_ms, ssl_verify)
+  return resolve_remote_proto(proto, cache_path, timeout_ms, ssl_verify)
 end
 
 ---
@@ -172,12 +274,14 @@ function _M.purge_cache_dir(cache_dir)
     if name ~= "." and name ~= ".." then
       local path = cache_dir .. "/" .. name
       local fattr = lfs.attributes(path)
-      if fattr and fattr.mode == "file" and match(name, "%.proto$") then
-        local ok, err = os.remove(path)
-        if ok then
-          count = count + 1
-        else
-          return count, "failed to remove " .. path .. ": " .. tostring(err)
+      if fattr and fattr.mode == "file" then
+        if match(name, "%.proto$") or match(name, "%.tmp%.") then
+          local ok, err = os.remove(path)
+          if ok then
+            count = count + 1
+          else
+            return count, "failed to remove " .. path .. ": " .. tostring(err)
+          end
         end
       end
     end
