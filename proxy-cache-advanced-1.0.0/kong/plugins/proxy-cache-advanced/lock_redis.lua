@@ -1,9 +1,4 @@
 ---
---- Created by yq
---- DateTime: 2026/2/25 23:00
----
-
----
 --- 防缓存击穿用 Redis 分布式锁，与缓存存储策略的 Redis 配置分离，使用独立连接配置。
 ---
 local redis = require "resty.redis"

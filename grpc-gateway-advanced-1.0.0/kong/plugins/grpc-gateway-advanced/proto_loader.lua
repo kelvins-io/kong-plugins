@@ -16,7 +16,7 @@ local ceil = math.ceil
 -- 默认缓存目录（可被 schema 中的 proto_cache_dir 覆盖）
 local DEFAULT_CACHE_DIR = "/usr/local/kong/proto_cache"
 local DEFAULT_HTTP_TIMEOUT_MS = 10000
-local LOCK_PREFIX = "grpc-gateway-advanced:proto:"
+local DEFAULT_LOCK_KEY_PREFIX = "grpc-gateway-advanced:proto:"
 local WAIT_POLL_INTERVAL = 0.05
 
 local _M = {}
@@ -59,15 +59,25 @@ local function cache_file_exists(cache_path)
   return attr and attr.mode == "file"
 end
 
---- 获取 Kong 节点上可用的 lock shared dict 名称
-local function get_lock_dict_name()
-  if ngx.shared.kong_locks then
-    return "kong_locks"
+--- 获取 lock shared dict 名称（来自配置 lock_dict_name）
+local function get_lock_dict_name(conf)
+  local dict_name = conf and conf.lock_dict_name
+  if type(dict_name) ~= "string" or dict_name == "" then
+    return nil
   end
-  if ngx.shared.stream_kong_locks then
-    return "stream_kong_locks"
+  if not ngx.shared[dict_name] then
+    return nil
   end
-  return nil
+  return dict_name
+end
+
+--- 获取 lock key 前缀（来自配置 lock_dict_key_prefix）
+local function get_lock_key_prefix(conf)
+  local prefix = conf and conf.lock_dict_key_prefix
+  if type(prefix) == "string" and prefix ~= "" then
+    return prefix
+  end
+  return DEFAULT_LOCK_KEY_PREFIX
 end
 
 --- 获取缓存根目录：使用配置项或默认路径
@@ -157,12 +167,12 @@ local function wait_for_cache(cache_path, timeout_ms)
 end
 
 --- 在分布式锁保护下解析远程 proto，同一 URL 在同一节点只触发一次下载
-local function resolve_remote_proto(url, cache_path, timeout_ms, ssl_verify)
+local function resolve_remote_proto(url, cache_path, timeout_ms, ssl_verify, conf)
   if cache_file_exists(cache_path) then
     return cache_path
   end
 
-  local dict_name = get_lock_dict_name()
+  local dict_name = get_lock_dict_name(conf)
   if not dict_name then
     ngx.log(ngx.WARN, "proto cache lock dict unavailable, fetching without deduplication")
     return fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
@@ -174,7 +184,7 @@ local function resolve_remote_proto(url, cache_path, timeout_ms, ssl_verify)
     return fetch_and_cache(url, cache_path, timeout_ms, ssl_verify)
   end
 
-  local lock_key = LOCK_PREFIX .. ngx.md5(cache_path)
+  local lock_key = get_lock_key_prefix(conf) .. ngx.md5(cache_path)
   local lock_wait = ceil(timeout_ms / 1000) + 5
   local lock_hold = lock_wait + 5
 
@@ -205,7 +215,7 @@ end
 ---
 --- 解析 proto 配置，返回可供 grpc_tools 使用的本地文件路径。
 --- @param proto string 本地路径或远程 URL（http/https）
---- @param conf table 插件配置（可选，用于 proto_cache_dir / proto_fetch_timeout / proto_ssl_verify）
+--- @param conf table 插件配置（可选，用于 proto_cache_dir / proto_fetch_timeout / proto_ssl_verify / lock_dict_name / lock_dict_key_prefix）
 --- @return string|nil 本地 .proto 文件路径
 --- @return string|nil 失败时的错误信息
 ---
@@ -238,7 +248,7 @@ function _M.resolve_proto(proto, conf)
     return cache_path
   end
 
-  return resolve_remote_proto(proto, cache_path, timeout_ms, ssl_verify)
+  return resolve_remote_proto(proto, cache_path, timeout_ms, ssl_verify, conf)
 end
 
 ---

@@ -63,9 +63,21 @@ return {
             default = 5242880,
             required = false,
           }},
+          { lock_shm = {
+            type = "record",
+            description = "Optional shared-memory lock (resty.lock) for memory/disk strategies. Independent from cache storage dict/path. When enabled, only one request per key hits upstream on the same node; others retry fetch until cache is populated or timeout.",
+            fields = {
+              { dict_name = { description = "Shared dict name for resty.lock. Must be defined in the Kong Nginx template (e.g. proxy_cache_advanced_locks).", type = "string", default = "kong_locks" } },
+              { key_prefix = { description = "Key prefix for lock entries in the shared dict.", type = "string", default = "proxy-cache-advanced:lock:" } },
+              { enable_cache_lock = { description = "Enable resty.lock for memory/disk strategies. Value: \"true\" or \"false\" (string).", type = "string", one_of = { "true", "false" }, default = "false", required = true } },
+              { cache_lock_ttl = { description = "Lock exptime in seconds; prevents deadlock if holder crashes.", type = "integer", default = 10, gt = 0 } },
+              { cache_lock_retry_count = { description = "Number of fetch retries when waiting for cache.", type = "integer", default = 50, gt = 0 } },
+              { cache_lock_retry_delay = { description = "Delay in seconds between fetch retries.", type = "number", default = 0.1, gt = 0 } },
+            },
+          }},
           { lock_redis = {
             type = "record",
-            description = "Optional separate Redis used only for cache stampede lock. When enabled, only one request per key hits upstream; others retry fetch until cache is populated or timeout.",
+            description = "Optional separate Redis used only for cache stampede lock (redis/tcos/aoss strategies). When enabled, only one request per key hits upstream; others retry fetch until cache is populated or timeout.",
             fields = {
               { host = typedefs.host({ description = "Redis host for lock.", default = "127.0.0.1" }) },
               { port = typedefs.port({ description = "Redis port for lock.", default = 6379 }) },
@@ -86,7 +98,7 @@ return {
           { memory = {
             type = "record",
             fields = {
-              { dictionary_name = { description = "The name of the shared dictionary in which to hold cache entities when the memory strategy is selected. Note that this dictionary currently must be defined manually in the Kong Nginx template.", type = "string",
+              { dict_name = { description = "The name of the shared dictionary in which to hold cache entities when the memory strategy is selected. Note that this dictionary currently must be defined manually in the Kong Nginx template.", type = "string",
                 default = "kong_db_cache",
               }},
             },
@@ -109,7 +121,7 @@ return {
           { disk = {
             type = "record",
             fields = {
-              { path = { description = "When using the `disk` strategy, this property specifies the directory path where cache files are stored. The directory will be created if it does not exist.", type = "string", default = "/usr/local/kong/tmp/kong-proxy-cache" } },
+              { path = { description = "When using the `disk` strategy, this property specifies the directory path where cache files are stored. The directory will be created if it does not exist.", type = "string", default = "/usr/local/kong/proxy-cache" } },
             },
           }},
           { tcos = {
@@ -160,7 +172,7 @@ return {
         local config = entity.config
 
         if config.strategy == "memory" then
-          local ok, err = check_shdict(config.memory.dictionary_name)
+          local ok, err = check_shdict(config.memory.dict_name)
           if not ok then
             return nil, err
           end
@@ -219,6 +231,16 @@ return {
         if config.lock_redis and (config.lock_redis.enable_cache_lock == true or config.lock_redis.enable_cache_lock == "true") then
           if not config.lock_redis.host or not config.lock_redis.port then
             return nil, "lock_redis.host and lock_redis.port are required when enable_cache_lock is true"
+          end
+        end
+
+        if config.lock_shm and (config.lock_shm.enable_cache_lock == true or config.lock_shm.enable_cache_lock == "true") then
+          if config.strategy ~= "memory" and config.strategy ~= "disk" then
+            return nil, "lock_shm is only supported when strategy is memory or disk"
+          end
+          local ok, err = check_shdict(config.lock_shm.dict_name)
+          if not ok then
+            return nil, err
           end
         end
 

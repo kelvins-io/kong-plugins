@@ -1,9 +1,4 @@
 ---
---- Created by yq
---- DateTime: 2026/2/25 23:01
----
-
----
 --- 腾讯云 COS（Cloud Object Storage）存储策略（策略关键字：tcos）
 --- 使用 COS REST API：PUT/GET/DELETE Object，需网络 I/O，与 Redis 一样走 queue/timer 异步 store
 ---

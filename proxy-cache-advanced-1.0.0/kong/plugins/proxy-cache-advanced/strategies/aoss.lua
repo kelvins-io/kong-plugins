@@ -1,9 +1,4 @@
 ---
---- Created by yq
---- DateTime: 2026/2/25 23:00
----
-
----
 --- 阿里云 OSS（Object Storage Service）存储策略
 --- 使用 OSS REST API + V1 签名：PUT/GET/DELETE Object，需网络 I/O，与 Redis 一样走 queue/timer 异步 store
 --- 签名说明：https://help.aliyun.com/zh/oss/developer-reference/include-signatures-in-the-authorization-header

@@ -2,8 +2,6 @@
 --- proxy-cache-advanced 的磁盘存储策略
 ---
 local cjson = require "cjson.safe"
-
-
 local ngx          = ngx
 local type         = type
 local time         = ngx.time
@@ -11,8 +9,6 @@ local setmetatable = setmetatable
 local open         = io.open
 local remove       = os.remove
 local match        = string.match
-local sub          = string.sub
-
 
 local _M = {}
 
@@ -20,11 +16,31 @@ local _M = {}
 local lfs_ok, lfs = pcall(require, "lfs")
 
 
---- 将缓存键转换为安全的文件名（作为文件路径组件）
+--- 将缓存键转换为安全的文件名前缀（作为文件路径组件）
 -- @string key 缓存键
--- @return 安全文件名（MD5 哈希值）
+-- @return 安全文件名前缀（MD5 哈希值）
 local function key_to_filename(key)
   return ngx.md5(key)
+end
+
+
+--- 根据 key 的前缀在目录中查找缓存文件（支持格式：{md5} 或 {md5}_{expiry_ts}）
+-- @string path 目录路径
+-- @string key_base key_to_filename(key) 的结果
+-- @return 找到则返回完整 filepath，否则返回 nil
+local function find_cache_filepath(path, key_base)
+  if not lfs_ok then
+    return nil
+  end
+  local prefix = key_base .. "_"
+  for name in lfs.dir(path) do
+    if name ~= "." and name ~= ".." then
+      if name == key_base or (name:sub(1, #prefix) == prefix) then
+        return path .. "/" .. name
+      end
+    end
+  end
+  return nil
 end
 
 
@@ -104,13 +120,13 @@ function _M:store(key, req_obj, req_ttl)
   end
 
   local path = self.opts.path
-
+  
   -- 确保目录存在，若不存在则创建
   local ok, err = ensure_dir(path)
   if not ok then
     return nil, "failed to ensure cache directory exists: " .. tostring(err)
   end
-
+  
   -- 写入文件前再次确认目录存在
   if lfs_ok then
     local attr, attr_err = lfs.attributes(path)
@@ -119,7 +135,16 @@ function _M:store(key, req_obj, req_ttl)
     end
   end
 
-  local filename = key_to_filename(key)
+  -- 文件名包含过期截止时间：{md5}_{expiry_ts}，便于按文件清理与排查
+  local key_base = key_to_filename(key)
+  local req_ttl_sec = (type(req_ttl) == "number" and req_ttl > 0) and req_ttl or 3600
+  local expiry_ts = time() + req_ttl_sec
+  local filename = key_base .. "_" .. tostring(expiry_ts)
+  -- 删除同 key 的旧文件（旧格式或旧过期时间），避免同一 key 多文件
+  local old_path = find_cache_filepath(path, key_base)
+  if old_path then
+    remove(old_path)
+  end
   local filepath = path .. "/" .. filename
 
   -- 以写模式打开文件（若不存在则创建）
@@ -144,11 +169,11 @@ function _M:store(key, req_obj, req_ttl)
     remove(filepath)
     return nil, "failed to write cache file"
   end
-
+  
   -- 刷新缓冲区，确保数据写入磁盘
   local flush_ok, flush_err = f:flush()
   f:close()
-
+  
   if not flush_ok then
     -- 写入成功但刷新失败，仍视为成功，仅记录日志便于调试
     if ngx and ngx.log then
@@ -168,7 +193,9 @@ function _M:fetch(key)
     return nil, "key must be a string"
   end
 
-  local filepath = self.opts.path .. "/" .. key_to_filename(key)
+  local path = self.opts.path
+  local key_base = key_to_filename(key)
+  local filepath = find_cache_filepath(path, key_base) or (path .. "/" .. key_base)
   local f, err = open(filepath, "r")
   if not f then
     -- 判断是否为文件不存在的错误（缓存未命中属正常情况）
@@ -209,7 +236,9 @@ function _M:purge(key)
     return nil, "key must be a string"
   end
 
-  local filepath = self.opts.path .. "/" .. key_to_filename(key)
+  local path = self.opts.path
+  local key_base = key_to_filename(key)
+  local filepath = find_cache_filepath(path, key_base) or (path .. "/" .. key_base)
   local ok, err = remove(filepath)
   if not ok and err then
     -- 若文件不存在，仍视为 purge 成功（幂等性）

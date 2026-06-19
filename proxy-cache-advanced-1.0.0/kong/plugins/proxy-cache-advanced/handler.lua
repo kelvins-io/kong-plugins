@@ -31,8 +31,52 @@ local tab_new = require("table.new")
 local strategies   = require "kong.plugins.proxy-cache-advanced.strategies"
 local STRATEGY_PATH = "kong.plugins.proxy-cache-advanced.strategies"
 local lock_redis   = require "kong.plugins.proxy-cache-advanced.lock_redis"
+local lock_shm     = require "kong.plugins.proxy-cache-advanced.lock_shm"
 local CACHE_VERSION = 1
 local EMPTY = {}
+
+
+local function cache_lock_enabled(lock_conf)
+  return lock_conf and (lock_conf.enable_cache_lock == true or lock_conf.enable_cache_lock == "true")
+end
+
+
+local function get_lock_backend(conf)
+  if strategies.LOCAL_DATA_STRATEGIES[conf.strategy] then
+    if cache_lock_enabled(conf.lock_shm) then
+      return "shm", conf.lock_shm
+    end
+    return nil
+  end
+
+  if cache_lock_enabled(conf.lock_redis) then
+    return "redis", conf.lock_redis
+  end
+  return nil
+end
+
+
+local function new_lock_client(backend, lock_conf)
+  if backend == "shm" then
+    return lock_shm.new(lock_conf)
+  end
+  if backend == "redis" then
+    return lock_redis.new(lock_conf)
+  end
+  return nil, "unknown lock backend"
+end
+
+
+local function release_cache_lock(backend, lock_conf, cache_key, lock_token)
+  if not lock_token or not lock_conf then
+    return
+  end
+
+  local lock_client = new_lock_client(backend, lock_conf)
+  if lock_client then
+    lock_client:release_lock(cache_key, lock_token)
+  end
+end
 
 -- Redis 等远程策略异步 store 使用 kong.tools.queue（按需加载）
 local Queue
@@ -58,12 +102,9 @@ local function remote_store_handler(handler_conf, entries)
       if not ok then
         return false, err
       end
-      -- 防击穿锁：store 成功后释放（使用独立 lock_redis 配置）
-      if entry.lock_token and entry.lock_redis_opts then
-        local lock_client = lock_redis.new(entry.lock_redis_opts)
-        if lock_client then
-          lock_client:release_lock(entry.cache_key, entry.lock_token)
-        end
+      -- 防击穿锁：store 成功后释放（远程策略使用 lock_redis）
+      if entry.lock_token and entry.lock_backend == "redis" and entry.lock_conf then
+        release_cache_lock(entry.lock_backend, entry.lock_conf, entry.cache_key, entry.lock_token)
       end
     end
   end
@@ -266,26 +307,24 @@ local function cacheable_response(conf, cc)
 end
 
 
--- 指示应尝试缓存此请求的响应（lock_token 用于防击穿，store 成功后由 lock_redis 释放）
-local function signal_cache_req(ctx, cache_key, cache_status, lock_token)
+-- 指示应尝试缓存此请求的响应（lock_token 用于防击穿，store 成功后释放）
+local function signal_cache_req(ctx, cache_key, cache_status, lock_token, lock_backend, lock_conf)
   ctx.proxy_cache = {
     cache_key = cache_key,
     lock_token = lock_token,
+    lock_backend = lock_backend,
+    lock_conf = lock_conf,
   }
 
   kong.response.set_header("X-Cache-Status", cache_status or "Miss")
 end
 
 
--- 当需要回源时：只要 conf.lock_redis.enable_cache_lock 为真则尝试加锁（使用独立 lock_redis 配置）
+-- 当需要回源时：memory/disk 使用 lock_shm（resty.lock），远程策略使用 lock_redis
 -- 返回 "go" 表示放行上游；返回 "hit", res 表示已从缓存返回，调用方需执行 kong.response.exit(res...)
--- cc: 请求 Cache-Control 表，用于重试命中时判断是否可返回缓存
 local function try_go_upstream_with_lock(conf, ctx, strategy, cache_key, cache_status, cc)
-  local lock_conf = conf.lock_redis
-  -- 兼容 boolean 与字符串 "true"/"false"（form-urlencoded 等会传成字符串）
-  local use_lock = lock_conf and (lock_conf.enable_cache_lock == true or lock_conf.enable_cache_lock == "true")
-
-  if not use_lock then
+  local lock_backend, lock_conf = get_lock_backend(conf)
+  if not lock_backend then
     return "go"
   end
 
@@ -293,15 +332,15 @@ local function try_go_upstream_with_lock(conf, ctx, strategy, cache_key, cache_s
   local retry_count = lock_conf.cache_lock_retry_count or 50
   local retry_delay = lock_conf.cache_lock_retry_delay or 0.1
 
-  local lock_client, err = lock_redis.new(lock_conf)
+  local lock_client, err = new_lock_client(lock_backend, lock_conf)
   if not lock_client then
-    kong.log.err("proxy-cache-advanced lock_redis.new failed: ", err)
+    kong.log.err("proxy-cache-advanced lock client init failed: ", err)
     return "go"
   end
   local token = lock_client:acquire_lock(cache_key, lock_ttl)
   if token then
     -- 当前请求作为回源者，放行上游并在 store 后释放锁
-    return "go", token
+    return "go", token, lock_backend, lock_conf
   end
 
   -- 未抢到锁：等待其他请求回源并写入缓存，重试 fetch
@@ -430,12 +469,12 @@ function ProxyCacheAdvancedHandler:access(conf)
 
     ctx.req_body = kong.request.get_raw_body()
 
-    local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Miss", cc)
+    local action, token, lock_backend, lock_conf = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Miss", cc)
     if action == "hit" then
       res = token
       -- 跳转到下方统一缓存命中出口
     else
-      signal_cache_req(ctx, cache_key, "Miss", token)
+      signal_cache_req(ctx, cache_key, "Miss", token, lock_backend, lock_conf)
       return
     end
 
@@ -447,11 +486,11 @@ function ProxyCacheAdvancedHandler:access(conf)
   if res.version ~= CACHE_VERSION then
     kong.log.notice("cache format mismatch, purging ", cache_key)
     strategy:purge(cache_key)
-    local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Bypass", cc)
+    local action, token, lock_backend, lock_conf = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Bypass", cc)
     if action == "hit" then
       res = token
     else
-      signal_cache_req(ctx, cache_key, "Bypass", token)
+      signal_cache_req(ctx, cache_key, "Bypass", token, lock_backend, lock_conf)
       return
     end
   end
@@ -459,31 +498,31 @@ function ProxyCacheAdvancedHandler:access(conf)
   -- 判断客户端是否会接受我们的缓存值
   if conf.cache_control then
     if cc["max-age"] and time() - res.timestamp > cc["max-age"] then
-      local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
+      local action, token, lock_backend, lock_conf = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
       if action == "hit" then
         res = token
       else
-        signal_cache_req(ctx, cache_key, "Refresh", token)
+        signal_cache_req(ctx, cache_key, "Refresh", token, lock_backend, lock_conf)
         return
       end
     end
 
     if cc["max-stale"] and time() - res.timestamp - res.ttl > cc["max-stale"] then
-      local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
+      local action, token, lock_backend, lock_conf = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
       if action == "hit" then
         res = token
       else
-        signal_cache_req(ctx, cache_key, "Refresh", token)
+        signal_cache_req(ctx, cache_key, "Refresh", token, lock_backend, lock_conf)
         return
       end
     end
 
     if cc["min-fresh"] and res.ttl - (time() - res.timestamp) < cc["min-fresh"] then
-      local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
+      local action, token, lock_backend, lock_conf = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
       if action == "hit" then
         res = token
       else
-        signal_cache_req(ctx, cache_key, "Refresh", token)
+        signal_cache_req(ctx, cache_key, "Refresh", token, lock_backend, lock_conf)
         return
       end
     end
@@ -491,11 +530,11 @@ function ProxyCacheAdvancedHandler:access(conf)
   else
     -- 不提供过期数据；响应可能已存储最多 `conf.storage_ttl` 秒
     if time() - res.timestamp > conf.cache_ttl then
-      local action, token = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
+      local action, token, lock_backend, lock_conf = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Refresh", cc)
       if action == "hit" then
         res = token
       else
-        signal_cache_req(ctx, cache_key, "Refresh", token)
+        signal_cache_req(ctx, cache_key, "Refresh", token, lock_backend, lock_conf)
         return
       end
     end
@@ -604,7 +643,11 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
       local ok, err = strategy:store(cache_key, res, ttl)
       if not ok then
         kong.log(err)
-      elseif strategy_name == "disk" and ttl and ttl > 0 then
+      else
+        if proxy_cache.lock_token and proxy_cache.lock_backend == "shm" and proxy_cache.lock_conf then
+          release_cache_lock(proxy_cache.lock_backend, proxy_cache.lock_conf, cache_key, proxy_cache.lock_token)
+        end
+        if strategy_name == "disk" and ttl and ttl > 0 then
         -- disk 策略：延时 TTL 后执行清理，删除该缓存文件，ngx.timer延迟删除耗费cpu推荐使用独立的删除程序定期清理
         -- local delay_sec = ttl
         -- local opts = strategy_opts
@@ -625,6 +668,7 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
         -- if not timer_ok then
         --   kong.log.err("proxy-cache-advanced failed to create disk TTL purge timer: ", timer_err)
         -- end
+        end
       end
     else
       -- Redis 等需网络 I/O 的策略：优先用 kong.tools.queue 批量写，不可用时回退到 timer
@@ -640,7 +684,8 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
           res = res,
           ttl = ttl,
           lock_token = proxy_cache.lock_token,
-          lock_redis_opts = proxy_cache.lock_token and conf.lock_redis or nil,
+          lock_backend = proxy_cache.lock_backend,
+          lock_conf = proxy_cache.lock_conf,
         })
         if ok_enq then
           use_timer = false
@@ -652,7 +697,8 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
       end
       if use_timer then
         local lock_token = proxy_cache.lock_token
-        local lock_redis_opts = (proxy_cache.lock_token and conf.lock_redis) or nil
+        local lock_backend = proxy_cache.lock_backend
+        local lock_conf = proxy_cache.lock_conf
         local ok, err = ngx.timer.at(0, function(premature)
           if premature then
             return
@@ -664,11 +710,8 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
           local store_ok, store_err = strategy:store(cache_key, res, ttl)
           if not store_ok then
             kong.log.err("proxy-cache-advanced redis store: ", store_err)
-          elseif lock_token and lock_redis_opts then
-            local lock_client = lock_redis.new(lock_redis_opts)
-            if lock_client then
-              lock_client:release_lock(cache_key, lock_token)
-            end
+          elseif lock_token and lock_backend == "redis" and lock_conf then
+            release_cache_lock(lock_backend, lock_conf, cache_key, lock_token)
           end
         end)
         if not ok then

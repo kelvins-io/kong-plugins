@@ -3,22 +3,19 @@
 --- DateTime: 2026/1/10 16:05
 ---
 local cjson = require "cjson.safe"
-
-
 local ngx          = ngx
 local type         = type
 local time         = ngx.time
 local shared       = ngx.shared
 local setmetatable = setmetatable
 
-
 local _M = {}
 
 
 --- Create new memory strategy object
--- @table opts Strategy options: contains 'dictionary_name' and 'ttl' fields
+-- @table opts Strategy options: contains 'dict_name' and 'ttl' fields
 function _M.new(opts)
-  local dict = shared[opts.dictionary_name]
+  local dict = shared[opts.dict_name]
 
   local self = {
     dict = dict,

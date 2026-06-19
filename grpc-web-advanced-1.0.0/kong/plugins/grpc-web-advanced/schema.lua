@@ -16,7 +16,7 @@ return {
         {
           proto_cache_dir = { description = "When proto is a remote URL, cache directory for downloaded .proto files. Default: /tmp/kong_grpc_web_proto_cache", type = "string",
             required = false,
-            default = "/usr/local/kong/tmp/proto_cache",
+            default = "/usr/local/kong/proto_cache",
           },
         },
         {
@@ -29,6 +29,18 @@ return {
           proto_fetch_ssl_verify = { description = "When proto is an https:// URL, whether to verify the remote TLS certificate. Default: true.", type = "boolean",
             required = false,
             default = false,
+          },
+        },
+        {
+          lock_dict_name = { description = "Shared dict name for resty.lock when downloading remote proto files. Must be defined in the Kong Nginx template (e.g. kong_locks). When the dict is unavailable, proto is fetched without deduplication.", type = "string",
+            required = false,
+            default = "kong_locks",
+          },
+        },
+        {
+          lock_dict_key_prefix = { description = "Key prefix for lock entries in the shared dict when downloading remote proto files.", type = "string",
+            required = false,
+            default = "grpc-web-advanced:proto:",
           },
         },
         {
