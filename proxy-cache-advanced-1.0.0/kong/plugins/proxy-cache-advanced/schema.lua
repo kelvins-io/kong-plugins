@@ -116,6 +116,7 @@ return {
               { timeout = { description = "When using the `redis` strategy, this property specifies the timeout in seconds of any command submitted to the Redis server.", type = "number", default = 60 } },
               { database = { description = "When using the `redis` strategy, this property specifies the Redis database to use.", type = "integer", default = 0 } },
               { key_prefix = { description = "When using the `redis` strategy, this property specifies the key prefix for all cache keys stored in Redis.", type = "string", default = "proxy-cache-advanced:" } },
+              { chunk_size = { description = "When using the `redis` strategy, maximum size in bytes per Redis value. Cache entries larger than this are split into multiple keys (`{key}:chunk:0`, `{key}:chunk:1`, ...). Default is 512 KiB (524288). Set to 0 to disable chunking.", type = "integer", default = 524288 } },
             },
           }},
           { disk = {
