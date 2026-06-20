@@ -123,6 +123,7 @@ return {
             type = "record",
             fields = {
               { path = { description = "When using the `disk` strategy, this property specifies the directory path where cache files are stored. The directory will be created if it does not exist.", type = "string", default = "/usr/local/kong/proxy-cache" } },
+              { chunk_size = { description = "When using the `disk` strategy, maximum size in bytes per file. Cache entries larger than this are split into multiple files (`{key}_{expiry}.chunk.0`, `{key}_{expiry}.chunk.1`, ...). Default is 5 MiB (5242880). Set to 0 to disable chunking.", type = "integer", default = 5242880 } },
             },
           }},
           { tcos = {

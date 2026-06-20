@@ -211,15 +211,17 @@ local function fetch_chunked(red, redis_key, meta)
   end
 
   for i = 1, #chunks do
-    if not chunks[i] or chunks[i] == ngx.null then
-      return nil, "request object chunk not in cache"
+    if not chunks[i] or chunks[i] == ngx.null or chunks[i] == "" then
+      delete_entry(red, redis_key)
+      return nil, "request object not in cache"
     end
   end
 
   local req_json = concat(chunks)
   local req_obj = cjson.decode(req_json)
   if not req_obj then
-    return nil, "could not decode request object"
+    delete_entry(red, redis_key)
+    return nil, "request object not in cache"
   end
 
   return req_obj
@@ -338,7 +340,8 @@ function _M:fetch(key)
     -- 单 key 格式
     local req_obj = meta
     if not req_obj then
-      return nil, "could not decode request object"
+      delete_entry(red, redis_key)
+      return nil, "request object not in cache"
     end
 
     return req_obj
@@ -373,16 +376,16 @@ function _M:touch(key, req_ttl, timestamp)
   if type(key) ~= "string" then
     return nil, "key must be a string"
   end
-  
+
   -- 先获取现有的缓存对象
   local req_obj, err = self:fetch(key)
   if not req_obj then
     return nil, err or "request object not in cache"
   end
-  
+
   -- 更新时间戳字段
   req_obj.timestamp = timestamp or time()
-  
+
   -- 重新存储以重置TTL
   return self:store(key, req_obj, req_ttl)
 end
@@ -395,27 +398,27 @@ function _M:flush(free_mem)
   -- 构建键前缀模式
   local prefix = self.opts.key_prefix or "proxy-cache-advanced:"
   local pattern = prefix .. "*"
-  
+
   -- 使用Redis连接执行清空操作
   return with_redis_client(self, function(red)
     -- 使用SCAN命令遍历所有匹配的键（避免阻塞）
     local cursor = "0"
     local keys_to_delete = {}
-    
+
     repeat
       local scan_result, scan_err = red:scan(cursor, "MATCH", pattern, "COUNT", 100)
       if not scan_result then
         return nil, "failed to scan Redis keys: " .. tostring(scan_err)
       end
-      
+
       cursor = scan_result[1]
       local keys = scan_result[2]
-      
+
       -- 收集要删除的键
       for i = 1, #keys do
         keys_to_delete[#keys_to_delete + 1] = keys[i]
       end
-      
+
       -- 如果收集的键太多，分批删除
       if #keys_to_delete >= 1000 then
         if #keys_to_delete > 0 then
@@ -427,7 +430,7 @@ function _M:flush(free_mem)
         end
       end
     until cursor == "0"
-    
+
     -- 删除剩余的键
     if #keys_to_delete > 0 then
       local del_ok, del_err = red:del(table.unpack(keys_to_delete))
@@ -435,7 +438,7 @@ function _M:flush(free_mem)
         return nil, "failed to delete keys from Redis: " .. tostring(del_err)
       end
     end
-    
+
     return true
   end)
 end

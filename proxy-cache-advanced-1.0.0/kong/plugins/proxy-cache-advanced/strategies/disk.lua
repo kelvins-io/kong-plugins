@@ -9,8 +9,14 @@ local setmetatable = setmetatable
 local open         = io.open
 local remove       = os.remove
 local match        = string.match
+local ceil         = math.ceil
+local concat       = table.concat
+
 
 local _M = {}
+
+-- 超过此大小（字节）的 JSON 将拆分为多个文件存储；可通过 opts.chunk_size 覆盖
+local DEFAULT_CHUNK_SIZE = 5242880  -- 5 MiB
 
 -- 尝试加载 LuaFileSystem，用于目录遍历（flush 操作）
 local lfs_ok, lfs = pcall(require, "lfs")
@@ -24,23 +30,216 @@ local function key_to_filename(key)
 end
 
 
---- 根据 key 的前缀在目录中查找缓存文件（支持格式：{md5} 或 {md5}_{expiry_ts}）
+--- 根据 key 的前缀在目录中查找缓存主文件（支持格式：{md5} 或 {md5}_{expiry_ts}；排除 .chunk.N 分片文件）
 -- @string path 目录路径
 -- @string key_base key_to_filename(key) 的结果
 -- @return 找到则返回完整 filepath，否则返回 nil
-local function find_cache_filepath(path, key_base)
+local function find_cache_meta_filepath(path, key_base)
   if not lfs_ok then
     return nil
   end
   local prefix = key_base .. "_"
   for name in lfs.dir(path) do
     if name ~= "." and name ~= ".." then
-      if name == key_base or (name:sub(1, #prefix) == prefix) then
+      if name == key_base then
+        return path .. "/" .. name
+      end
+      if name:sub(1, #prefix) == prefix and not name:find("%.chunk%.", 1, true) then
         return path .. "/" .. name
       end
     end
   end
   return nil
+end
+
+
+--- 列出同一 cache key 对应的所有文件（主文件 + 分片）
+local function list_cache_files(path, key_base)
+  local files = {}
+  if not lfs_ok then
+    return files
+  end
+  local prefix = key_base .. "_"
+  for name in lfs.dir(path) do
+    if name ~= "." and name ~= ".." then
+      if name == key_base or name:sub(1, #prefix) == prefix then
+        files[#files + 1] = path .. "/" .. name
+      end
+    end
+  end
+  return files
+end
+
+
+local function delete_cache_files(path, key_base)
+  local files = list_cache_files(path, key_base)
+  for i = 1, #files do
+    remove(files[i])
+  end
+  return true
+end
+
+
+local function get_chunk_size(opts)
+  local size = opts.chunk_size
+  if size == nil then
+    return DEFAULT_CHUNK_SIZE
+  end
+  if size <= 0 then
+    return nil
+  end
+  return size
+end
+
+
+local function is_chunked_meta(val)
+  if type(val) ~= "table" then
+    return false
+  end
+  return val.__pca_chunked == true
+    and type(val.chunks) == "number"
+    and val.chunks > 0
+end
+
+
+local function build_chunk_filepath(meta_filepath, index)
+  return meta_filepath .. ".chunk." .. index
+end
+
+
+local function chunk_file_exists(chunk_path)
+  local f = open(chunk_path, "r")
+  if not f then
+    return false
+  end
+  f:close()
+  return true
+end
+
+
+--- 校验 meta.chunks 声明的全部分片文件是否均存在
+local function verify_chunk_files_complete(meta_filepath, num_chunks)
+  for i = 0, num_chunks - 1 do
+    if not chunk_file_exists(build_chunk_filepath(meta_filepath, i)) then
+      return false
+    end
+  end
+  return true
+end
+
+
+local function write_file(filepath, content)
+  local f, err_open = open(filepath, "w")
+  if not f then
+    return nil, "failed to open file for writing: " .. tostring(err_open)
+  end
+
+  local ok_write = f:write(content)
+  if not ok_write then
+    f:close()
+    remove(filepath)
+    return nil, "failed to write cache file"
+  end
+
+  local flush_ok, flush_err = f:flush()
+  f:close()
+
+  if not flush_ok and ngx and ngx.log then
+    ngx.log(ngx.WARN, "cache file written but flush failed: ", tostring(flush_err))
+  end
+
+  return true
+end
+
+
+local function read_file(filepath)
+  local f, err = open(filepath, "r")
+  if not f then
+    return nil, err
+  end
+
+  local content = f:read("*a")
+  f:close()
+  return content
+end
+
+
+local function store_chunked(meta_filepath, req_json, chunk_size)
+  local total_len = #req_json
+  local num_chunks = ceil(total_len / chunk_size)
+  local written_chunks = {}
+
+  for i = 0, num_chunks - 1 do
+    local start = i * chunk_size + 1
+    local chunk = req_json:sub(start, start + chunk_size - 1)
+    local chunk_path = build_chunk_filepath(meta_filepath, i)
+    local ok, err = write_file(chunk_path, chunk)
+    if not ok then
+      for j = 1, #written_chunks do
+        remove(written_chunks[j])
+      end
+      return nil, err
+    end
+    written_chunks[#written_chunks + 1] = chunk_path
+  end
+
+  local meta_json = cjson.encode({
+    __pca_chunked = true,
+    chunks = num_chunks,
+  })
+  if not meta_json then
+    for i = 1, #written_chunks do
+      remove(written_chunks[i])
+    end
+    return nil, "could not encode chunk metadata"
+  end
+
+  local ok, err = write_file(meta_filepath, meta_json)
+  if not ok then
+    for i = 1, #written_chunks do
+      remove(written_chunks[i])
+    end
+    return nil, err
+  end
+
+  return true
+end
+
+
+local function fetch_chunked(meta_filepath, meta, path, key_base)
+  if not verify_chunk_files_complete(meta_filepath, meta.chunks) then
+    if path and key_base then
+      delete_cache_files(path, key_base)
+    end
+    return nil, "request object not in cache"
+  end
+
+  local parts = {}
+  for i = 0, meta.chunks - 1 do
+    local chunk_path = build_chunk_filepath(meta_filepath, i)
+    local chunk, err = read_file(chunk_path)
+    if not chunk or chunk == "" then
+      if path and key_base then
+        delete_cache_files(path, key_base)
+      end
+      return nil, "request object not in cache"
+    end
+    if err then
+      return nil, "failed to read cache chunk file: " .. tostring(err)
+    end
+    parts[#parts + 1] = chunk
+  end
+
+  local req_json = concat(parts)
+  local req_obj = cjson.decode(req_json)
+  if not req_obj then
+    if path and key_base then
+      delete_cache_files(path, key_base)
+    end
+    return nil, "request object not in cache"
+  end
+
+  return req_obj
 end
 
 
@@ -120,13 +319,13 @@ function _M:store(key, req_obj, req_ttl)
   end
 
   local path = self.opts.path
-  
+
   -- 确保目录存在，若不存在则创建
   local ok, err = ensure_dir(path)
   if not ok then
     return nil, "failed to ensure cache directory exists: " .. tostring(err)
   end
-  
+
   -- 写入文件前再次确认目录存在
   if lfs_ok then
     local attr, attr_err = lfs.attributes(path)
@@ -140,45 +339,25 @@ function _M:store(key, req_obj, req_ttl)
   local req_ttl_sec = (type(req_ttl) == "number" and req_ttl > 0) and req_ttl or 3600
   local expiry_ts = time() + req_ttl_sec
   local filename = key_base .. "_" .. tostring(expiry_ts)
-  -- 删除同 key 的旧文件（旧格式或旧过期时间），避免同一 key 多文件
-  local old_path = find_cache_filepath(path, key_base)
-  if old_path then
-    remove(old_path)
-  end
+  -- 删除同 key 的旧文件（单文件 / 分片格式），避免同一 key 多文件
+  delete_cache_files(path, key_base)
   local filepath = path .. "/" .. filename
 
-  -- 以写模式打开文件（若不存在则创建）
-  local f, err_open = open(filepath, "w")
-  if not f then
-    -- 若打开失败，再次确保目录存在并重试一次
-    local retry_ok, retry_err = ensure_dir(path)
-    if retry_ok then
-      f, err_open = open(filepath, "w")
-      if not f then
-        return nil, "failed to open file for writing after directory creation: " .. tostring(err_open)
-      end
-    else
-      return nil, "failed to open file for writing: " .. tostring(err_open) .. " (directory check: " .. tostring(retry_err) .. ")"
+  local chunk_size = get_chunk_size(self.opts)
+  local use_chunks = chunk_size and #req_json > chunk_size
+
+  if use_chunks then
+    local ok_store, err_store = store_chunked(filepath, req_json, chunk_size)
+    if not ok_store then
+      delete_cache_files(path, key_base)
+      return nil, err_store
     end
+    return true, req_json
   end
 
-  local ok_write = f:write(req_json)
+  local ok_write, err_write = write_file(filepath, req_json)
   if not ok_write then
-    f:close()
-    -- 若写入失败，删除不完整文件
-    remove(filepath)
-    return nil, "failed to write cache file"
-  end
-  
-  -- 刷新缓冲区，确保数据写入磁盘
-  local flush_ok, flush_err = f:flush()
-  f:close()
-  
-  if not flush_ok then
-    -- 写入成功但刷新失败，仍视为成功，仅记录日志便于调试
-    if ngx and ngx.log then
-      ngx.log(ngx.WARN, "cache file written but flush failed: ", tostring(flush_err))
-    end
+    return nil, err_write
   end
 
   return true, req_json
@@ -195,11 +374,9 @@ function _M:fetch(key)
 
   local path = self.opts.path
   local key_base = key_to_filename(key)
-  local filepath = find_cache_filepath(path, key_base) or (path .. "/" .. key_base)
-  local f, err = open(filepath, "r")
-  if not f then
-    -- 判断是否为文件不存在的错误（缓存未命中属正常情况）
-    -- 错误格式可能为："No such file or directory" 或 "path: No such file or directory"
+  local filepath = find_cache_meta_filepath(path, key_base) or (path .. "/" .. key_base)
+  local req_json, err = read_file(filepath)
+  if not req_json then
     local err_str = tostring(err or "")
     if err_str:find("No such file") or err_str:find("not found") or err_str:find("does not exist") then
       return nil, "request object not in cache"
@@ -207,22 +384,29 @@ function _M:fetch(key)
     return nil, "failed to open cache file: " .. err_str
   end
 
-  local req_json = f:read("*a")
-  f:close()
-
-  if not req_json or req_json == "" then
+  if req_json == "" then
     return nil, "request object not in cache"
   end
 
-  local req_obj = cjson.decode(req_json)
-  if not req_obj then
-    return nil, "could not decode request object"
+  local meta = cjson.decode(req_json)
+  local req_obj
+  if is_chunked_meta(meta) then
+    req_obj, err = fetch_chunked(filepath, meta, path, key_base)
+    if not req_obj then
+      return nil, err
+    end
+  else
+    req_obj = meta
+    if not req_obj then
+      delete_cache_files(path, key_base)
+      return nil, "request object not in cache"
+    end
   end
 
   -- 检查 TTL 是否已过期
   local ttl = req_obj.ttl or 0
   if ttl > 0 and (time() - (req_obj.timestamp or 0)) > ttl then
-    remove(filepath)
+    delete_cache_files(path, key_base)
     return nil, "request object not in cache"
   end
 
@@ -238,15 +422,7 @@ function _M:purge(key)
 
   local path = self.opts.path
   local key_base = key_to_filename(key)
-  local filepath = find_cache_filepath(path, key_base) or (path .. "/" .. key_base)
-  local ok, err = remove(filepath)
-  if not ok and err then
-    -- 若文件不存在，仍视为 purge 成功（幂等性）
-    local err_str = tostring(err)
-    if not (err_str:find("No such file") or err_str:find("not found") or err_str:find("does not exist")) then
-      return nil, "failed to remove cache file: " .. err_str
-    end
-  end
+  delete_cache_files(path, key_base)
 
   return true
 end

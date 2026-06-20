@@ -64,7 +64,7 @@ return {
 
       end
 
-      return kong.response.exit(204)
+      return kong.response.exit(200)
     end
   },
   ["/proxy-cache-advanced/:cache_key"] = {
@@ -120,7 +120,7 @@ return {
             end
           end
 
-          return kong.response.exit(204)
+          return kong.response.exit(200)
         end
 
       end
@@ -196,7 +196,7 @@ return {
         end
       end
 
-      return kong.response.exit(204)
+      return kong.response.exit(200)
     end
   },
 }
