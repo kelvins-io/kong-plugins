@@ -15,6 +15,7 @@ local tonumber         = tonumber
 local max              = math.max
 local floor            = math.floor
 local lower            = string.lower
+local find             = string.find
 local concat           = table.concat
 local time             = ngx.time
 local resp_get_headers = ngx.resp and ngx.resp.get_headers
@@ -75,6 +76,73 @@ local function release_cache_lock(backend, lock_conf, cache_key, lock_token)
   local lock_client = new_lock_client(backend, lock_conf)
   if lock_client then
     lock_client:release_lock(cache_key, lock_token)
+  end
+end
+
+
+local function is_llm_enabled(conf)
+  return conf.llm and (conf.llm.enable == true or conf.llm.enable == "true")
+end
+
+
+local function is_json_content_type(ct)
+  if type(ct) == "table" then
+    ct = ct[1]
+  end
+  if type(ct) ~= "string" or ct == "" then
+    return false
+  end
+  return find(lower(ct), "application/json", 1, true) ~= nil
+end
+
+
+local function is_sse_content_type(ct)
+  if type(ct) == "table" then
+    ct = ct[1]
+  end
+  if type(ct) ~= "string" or ct == "" then
+    return false
+  end
+  ct = lower(ct)
+  local semi = find(ct, ";", 1, true)
+  if semi then
+    ct = ct:sub(1, semi - 1)
+  end
+  ct = ct:match("^%s*(.-)%s*$") or ct
+  return ct == "text/event-stream"
+end
+
+
+local function abandon_cache_req(ctx)
+  local proxy_cache = ctx.proxy_cache
+  if not proxy_cache then
+    return
+  end
+
+  local token = proxy_cache.lock_token
+  local backend = proxy_cache.lock_backend
+  local lock_conf = proxy_cache.lock_conf
+  local key = proxy_cache.cache_key
+  ctx.proxy_cache = nil
+
+  if not token then
+    return
+  end
+
+  -- header/body_filter 禁止 Redis 网络 I/O；shm 可同步释放
+  if backend == "shm" then
+    release_cache_lock(backend, lock_conf, key, token)
+    return
+  end
+
+  local ok, err = ngx.timer.at(0, function(premature)
+    if premature then
+      return
+    end
+    release_cache_lock(backend, lock_conf, key, token)
+  end)
+  if not ok then
+    kong.log.err("proxy-cache-advanced failed to create timer for lock release: ", err)
   end
 end
 
@@ -212,6 +280,7 @@ end
 
 local function cacheable_request(conf, cc)
   -- TODO 将这些搜索重构为 O(1) 复杂度
+  local llm_on = is_llm_enabled(conf)
   do
     local method = kong.request.get_method()
     local method_match = false
@@ -222,14 +291,16 @@ local function cacheable_request(conf, cc)
       end
     end
 
-    if not method_match then
+    -- LLM 接口几乎都是 POST；开启 llm 时允许 POST 即使未写入 request_method
+    if not method_match and not (llm_on and method == "POST") then
       return false
     end
   end
 
   -- 检查显式禁止指令
   -- TODO 注意 no-cache 在此处并不完全准确
-  if conf.cache_control and (cc["no-store"] or cc["no-cache"] or
+  -- LLM 请求通常带 Authorization，客户端/SSE 也常带 no-cache；开启 llm 时不因此跳过
+  if not llm_on and conf.cache_control and (cc["no-store"] or cc["no-cache"] or
      ngx.var.authorization) then
     return false
   end
@@ -265,25 +336,28 @@ local function cacheable_response(conf, cc)
       return false
     end
 
-    local t, subtype, params = parse_mime_type(content_type)
-    local content_match = false
-    for i = 1, #conf.content_type do
-      local expected_ct = conf.content_type[i]
-      local exp_type, exp_subtype, exp_params = parse_mime_type(expected_ct)
-      if exp_type then
-        if (exp_type == "*" or t == exp_type) and
-          (exp_subtype == "*" or subtype == exp_subtype) then
-          local params_match = true
-          for key, value in pairs(exp_params or EMPTY) do
-            if value ~= (params or EMPTY)[key] then
-              params_match = false
+    -- 开启 llm 时 text/event-stream 视为可缓存，无需写入 content_type 白名单
+    local content_match = is_llm_enabled(conf) and is_sse_content_type(content_type)
+    if not content_match then
+      local t, subtype, params = parse_mime_type(content_type)
+      for i = 1, #conf.content_type do
+        local expected_ct = conf.content_type[i]
+        local exp_type, exp_subtype, exp_params = parse_mime_type(expected_ct)
+        if exp_type then
+          if (exp_type == "*" or t == exp_type) and
+            (exp_subtype == "*" or subtype == exp_subtype) then
+            local params_match = true
+            for key, value in pairs(exp_params or EMPTY) do
+              if value ~= (params or EMPTY)[key] then
+                params_match = false
+                break
+              end
+            end
+            if params_match and
+              (nkeys(params or EMPTY) == nkeys(exp_params or EMPTY)) then
+              content_match = true
               break
             end
-          end
-          if params_match and
-            (nkeys(params or EMPTY) == nkeys(exp_params or EMPTY)) then
-            content_match = true
-            break
           end
         end
       end
@@ -294,13 +368,16 @@ local function cacheable_response(conf, cc)
     end
   end
 
-  if conf.cache_control and (cc["private"] or cc["no-store"] or cc["no-cache"])
-  then
-    return false
-  end
+  -- LLM/SSE 上游常带 Cache-Control: no-cache，开启 llm 时不按 RFC 拦截
+  if not is_llm_enabled(conf) then
+    if conf.cache_control and (cc["private"] or cc["no-store"] or cc["no-cache"])
+    then
+      return false
+    end
 
-  if conf.cache_control and resource_ttl(cc) <= 0 then
-    return false
+    if conf.cache_control and resource_ttl(cc) <= 0 then
+      return false
+    end
   end
 
   return true
@@ -373,6 +450,105 @@ local function try_go_upstream_with_lock(conf, ctx, strategy, cache_key, cache_s
 end
 
 
+-- 将完整响应写入缓存（body_filter 末包或 SSE 流结束后调用）
+local function persist_cache(conf, ctx, proxy_cache, body)
+  local body_size = #body
+
+  if conf.max_body_size and conf.max_body_size > 0 and body_size > conf.max_body_size then
+    kong.log.debug("response body size (", body_size, " bytes) exceeds max_body_size (",
+                   conf.max_body_size, " bytes), skipping cache")
+    abandon_cache_req(ctx)
+    return
+  end
+
+  local res = {
+    status    = kong.response.get_status(),
+    headers   = proxy_cache.res_headers,
+    body      = body,
+    body_len  = body_size,
+    timestamp = time(),
+    ttl       = proxy_cache.res_ttl,
+    version   = CACHE_VERSION,
+    req_body  = ctx.req_body,
+  }
+
+  local ttl = conf.storage_ttl or conf.cache_control and proxy_cache.res_ttl or
+              conf.cache_ttl
+
+  local strategy_name = conf.strategy
+  local strategy_opts = conf[conf.strategy]
+  local key = proxy_cache.cache_key
+
+  -- 在 body_filter 阶段 Kong 禁止网络 I/O（如 TCP/Redis），仅 memory 等本地策略可同步写缓存
+  if strategies.LOCAL_DATA_STRATEGIES[strategy_name] then
+    local strategy = require(STRATEGY_PATH)({
+      strategy_name = strategy_name,
+      strategy_opts = strategy_opts,
+    })
+    local ok, err = strategy:store(key, res, ttl)
+    if not ok then
+      kong.log(err)
+    else
+      if proxy_cache.lock_token and proxy_cache.lock_backend == "shm" and proxy_cache.lock_conf then
+        release_cache_lock(proxy_cache.lock_backend, proxy_cache.lock_conf, key, proxy_cache.lock_token)
+      end
+      if strategy_name == "disk" and ttl and ttl > 0 then
+        -- disk 策略：延时 TTL 后执行清理，删除该缓存文件，ngx.timer延迟删除耗费cpu推荐使用独立的删除程序定期清理
+      end
+    end
+    return
+  end
+
+  -- Redis 等需网络 I/O 的策略：优先用 kong.tools.queue 批量写，不可用时回退到 timer
+  local use_timer = true
+  local ok_load, q = pcall(get_queue)
+  if ok_load and q then
+    local queue_conf = build_queue_conf(conf)
+    local handler_conf = { STRATEGY_PATH = STRATEGY_PATH }
+    local ok_enq, err_enq = q.enqueue(queue_conf, remote_store_handler, handler_conf, {
+      strategy_name = strategy_name,
+      strategy_opts = strategy_opts,
+      cache_key = key,
+      res = res,
+      ttl = ttl,
+      lock_token = proxy_cache.lock_token,
+      lock_backend = proxy_cache.lock_backend,
+      lock_conf = proxy_cache.lock_conf,
+    })
+    if ok_enq then
+      use_timer = false
+    else
+      kong.log.warn("proxy-cache-advanced queue enqueue failed, falling back to timer: ", err_enq)
+    end
+  else
+    kong.log.warn("proxy-cache-advanced kong.tools.queue not available, using timer: ", q)
+  end
+  if use_timer then
+    local lock_token = proxy_cache.lock_token
+    local lock_backend = proxy_cache.lock_backend
+    local lock_conf = proxy_cache.lock_conf
+    local ok, err = ngx.timer.at(0, function(premature)
+      if premature then
+        return
+      end
+      local strategy = require(STRATEGY_PATH)({
+        strategy_name = strategy_name,
+        strategy_opts = strategy_opts,
+      })
+      local store_ok, store_err = strategy:store(key, res, ttl)
+      if not store_ok then
+        kong.log.err("proxy-cache-advanced redis store: ", store_err)
+      elseif lock_token and lock_backend == "redis" and lock_conf then
+        release_cache_lock(lock_backend, lock_conf, key, lock_token)
+      end
+    end)
+    if not ok then
+      kong.log.err("proxy-cache-advanced failed to create timer for cache store: ", err)
+    end
+  end
+end
+
+
 local ProxyCacheAdvancedHandler = {
   VERSION = kong_meta.version,
   PRIORITY = 101,
@@ -438,13 +614,26 @@ function ProxyCacheAdvancedHandler:access(conf)
     uri = lower(uri)
   end
 
+  local headers = kong.request.get_headers()
+  local llm_digest
+  local req_body
+  if is_llm_enabled(conf) then
+    req_body = kong.request.get_raw_body()
+    if is_json_content_type(headers["content-type"]) then
+      llm_digest = cache_key.llm_digest(req_body, conf.llm)
+    else
+      kong.log.debug("proxy-cache-advanced llm: skip llm key dimensions, request is not JSON")
+    end
+  end
+
   local cache_key, err = cache_key.build_cache_key(consumer and consumer.id,
                                                    route    and route.id,
                                                    kong.request.get_method(),
                                                    uri,
                                                    kong.request.get_query(),
-                                                   kong.request.get_headers(),
-                                                   conf)
+                                                   headers,
+                                                   conf,
+                                                   llm_digest)
   if err then
     kong.log.err(err)
     return
@@ -467,7 +656,7 @@ function ProxyCacheAdvancedHandler:access(conf)
       return kong.response.exit(ngx.HTTP_GATEWAY_TIMEOUT)
     end
 
-    ctx.req_body = kong.request.get_raw_body()
+    ctx.req_body = req_body or kong.request.get_raw_body()
 
     local action, token, lock_backend, lock_conf = try_go_upstream_with_lock(conf, ctx, strategy, cache_key, "Miss", cc)
     if action == "hit" then
@@ -584,11 +773,17 @@ function ProxyCacheAdvancedHandler:header_filter(conf)
   if cacheable_response(conf, cc) then
     -- TODO: 是否应使用 kong.conf 配置的限制？
     proxy_cache.res_headers = resp_get_headers(0, true)
-    proxy_cache.res_ttl = conf.cache_control and resource_ttl(cc) or conf.cache_ttl
+    -- LLM/SSE 常带 no-cache，TTL 使用插件 cache_ttl，避免被算成 0
+    if is_llm_enabled(conf) then
+      proxy_cache.res_ttl = conf.cache_ttl
+    else
+      proxy_cache.res_ttl = conf.cache_control and resource_ttl(cc) or conf.cache_ttl
+    end
+    proxy_cache.is_sse = is_sse_content_type(ngx.var.sent_http_content_type)
 
   else
     kong.response.set_header("X-Cache-Status", "Bypass")
-    ctx.proxy_cache = nil
+    abandon_cache_req(ctx)
   end
 
   -- TODO 处理 Vary 头
@@ -602,124 +797,49 @@ function ProxyCacheAdvancedHandler:body_filter(conf)
     return
   end
 
+  -- SSE：不要调用 get_raw_body()（它会把中间 chunk 置空，打断流式）。
+  -- 首次 miss 原样透传 ngx.arg，流结束后再整包入库；命中走 access 的 exit 一次性回放。
+  if proxy_cache.is_sse then
+    local chunk = ngx.arg[1]
+    local eof = ngx.arg[2]
+
+    if type(chunk) == "string" and chunk ~= "" then
+      local new_size = (proxy_cache.body_size or 0) + #chunk
+      if conf.max_body_size and conf.max_body_size > 0 and new_size > conf.max_body_size then
+        kong.log.debug("sse response body size exceeds max_body_size, skipping cache")
+        abandon_cache_req(ctx)
+        return
+      end
+      local buf = proxy_cache.body_chunks
+      if not buf then
+        buf = { n = 0 }
+        proxy_cache.body_chunks = buf
+      end
+      buf.n = buf.n + 1
+      buf[buf.n] = chunk
+      proxy_cache.body_size = new_size
+    end
+
+    if not eof then
+      return
+    end
+
+    local body = ""
+    local buf = proxy_cache.body_chunks
+    if buf and buf.n > 0 then
+      body = concat(buf, "", 1, buf.n)
+    end
+    persist_cache(conf, ctx, proxy_cache, body)
+    return
+  end
+
   local body = kong.response.get_raw_body()
   if not body then
     return
   end
 
-  local body_size = #body
-
-  -- 检查响应 body 大小是否超过限制
-  if conf.max_body_size and conf.max_body_size > 0 and body_size > conf.max_body_size then
-    kong.log.debug("response body size (", body_size, " bytes) exceeds max_body_size (", conf.max_body_size, " bytes), skipping cache")
-    ctx.proxy_cache = nil
-    return
-  end
-
-  local res = {
-    status    = kong.response.get_status(),
-    headers   = proxy_cache.res_headers,
-    body      = body,
-    body_len  = body_size,
-    timestamp = time(),
-    ttl       = proxy_cache.res_ttl,
-    version   = CACHE_VERSION,
-    req_body  = ctx.req_body,
-  }
-
-  local ttl = conf.storage_ttl or conf.cache_control and proxy_cache.res_ttl or
-              conf.cache_ttl
-
-  local strategy_name = conf.strategy
-  local strategy_opts = conf[conf.strategy]
-  local cache_key = proxy_cache.cache_key
-
-  -- 在 body_filter 阶段 Kong 禁止网络 I/O（如 TCP/Redis），仅 memory 等本地策略可同步写缓存
-  if strategies.LOCAL_DATA_STRATEGIES[strategy_name] then
-      local strategy = require(STRATEGY_PATH)({
-        strategy_name = strategy_name,
-        strategy_opts = strategy_opts,
-      })
-      local ok, err = strategy:store(cache_key, res, ttl)
-      if not ok then
-        kong.log(err)
-      else
-        if proxy_cache.lock_token and proxy_cache.lock_backend == "shm" and proxy_cache.lock_conf then
-          release_cache_lock(proxy_cache.lock_backend, proxy_cache.lock_conf, cache_key, proxy_cache.lock_token)
-        end
-        if strategy_name == "disk" and ttl and ttl > 0 then
-        -- disk 策略：延时 TTL 后执行清理，删除该缓存文件，ngx.timer延迟删除耗费cpu推荐使用独立的删除程序定期清理
-        -- local delay_sec = ttl
-        -- local opts = strategy_opts
-        -- local key = cache_key
-        -- local timer_ok, timer_err = ngx.timer.at(delay_sec, function(premature)
-        --   if premature then
-        --     return
-        --   end
-        --   local disk_strategy = require(STRATEGY_PATH)({
-        --     strategy_name = "disk",
-        --     strategy_opts = opts,
-        --   })
-        --   local purge_ok, purge_err = disk_strategy:purge(key)
-        --   if not purge_ok then
-        --     kong.log.err("proxy-cache-advanced disk TTL purge failed: ", purge_err)
-        --   end
-        -- end)
-        -- if not timer_ok then
-        --   kong.log.err("proxy-cache-advanced failed to create disk TTL purge timer: ", timer_err)
-        -- end
-        end
-      end
-    else
-      -- Redis 等需网络 I/O 的策略：优先用 kong.tools.queue 批量写，不可用时回退到 timer
-      local use_timer = true
-      local ok_load, q = pcall(get_queue)
-      if ok_load and q then
-        local queue_conf = build_queue_conf(conf)
-        local handler_conf = { STRATEGY_PATH = STRATEGY_PATH }
-        local ok_enq, err_enq = q.enqueue(queue_conf, remote_store_handler, handler_conf, {
-          strategy_name = strategy_name,
-          strategy_opts = strategy_opts,
-          cache_key = cache_key,
-          res = res,
-          ttl = ttl,
-          lock_token = proxy_cache.lock_token,
-          lock_backend = proxy_cache.lock_backend,
-          lock_conf = proxy_cache.lock_conf,
-        })
-        if ok_enq then
-          use_timer = false
-        else
-          kong.log.warn("proxy-cache-advanced queue enqueue failed, falling back to timer: ", err_enq)
-        end
-      else
-        kong.log.warn("proxy-cache-advanced kong.tools.queue not available, using timer: ", q)
-      end
-      if use_timer then
-        local lock_token = proxy_cache.lock_token
-        local lock_backend = proxy_cache.lock_backend
-        local lock_conf = proxy_cache.lock_conf
-        local ok, err = ngx.timer.at(0, function(premature)
-          if premature then
-            return
-          end
-          local strategy = require(STRATEGY_PATH)({
-            strategy_name = strategy_name,
-            strategy_opts = strategy_opts,
-          })
-          local store_ok, store_err = strategy:store(cache_key, res, ttl)
-          if not store_ok then
-            kong.log.err("proxy-cache-advanced redis store: ", store_err)
-          elseif lock_token and lock_backend == "redis" and lock_conf then
-            release_cache_lock(lock_backend, lock_conf, cache_key, lock_token)
-          end
-        end)
-        if not ok then
-          kong.log.err("proxy-cache-advanced failed to create timer for cache store: ", err)
-        end
-      end
-    end
-  end
+  persist_cache(conf, ctx, proxy_cache, body)
+end
 
 
 return ProxyCacheAdvancedHandler
