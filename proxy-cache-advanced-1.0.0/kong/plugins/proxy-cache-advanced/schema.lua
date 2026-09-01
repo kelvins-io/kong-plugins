@@ -160,7 +160,7 @@ return {
             type = "record",
             description = "LLM cache mode. When enable is true, the cache key is extended with model_id + prompt hash + temperature parsed from a JSON request body. SSE (text/event-stream) is fully buffered on the first miss and replayed in one shot (still as SSE) on later hits.",
             fields = {
-              { enable = { description = "Enable LLM cache-key dimensions and SSE full-response caching. Value: \"true\" or \"false\" (string).", type = "string", one_of = { "true", "false" }, default = "false", required = true } },
+              { enable = { description = "Enable LLM cache-key dimensions and SSE full-response caching. Value: \"true\" or \"false\" (string). When true, strategy must be a remote store (redis, tcos, or aoss); memory and disk are not allowed.", type = "string", one_of = { "true", "false" }, default = "false", required = true } },
               { model_field = { description = "JSON field path for model id (e.g. model or model_id). Falls back to model_id/model if missing.", type = "string", default = "model" } },
               { prompt_field = { description = "JSON field path for prompt (e.g. messages or prompt). Falls back to prompt/messages/input if missing.", type = "string", default = "messages" } },
               { temperature_field = { description = "JSON field path for temperature.", type = "string", default = "temperature" } },
@@ -253,6 +253,13 @@ return {
           local ok, err = check_shdict(config.lock_shm.dict_name)
           if not ok then
             return nil, err
+          end
+        end
+
+        local llm = config.llm
+        if llm and (llm.enable == true or llm.enable == "true") then
+          if strategies.LOCAL_DATA_STRATEGIES[config.strategy] then
+            return nil, "llm.enable cannot be used with local strategies (memory, disk); use redis, tcos, or aoss"
           end
         end
 

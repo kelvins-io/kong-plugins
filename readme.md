@@ -15,6 +15,7 @@ https://51pd9106ao09.vicp.fun/add
 go-log：file-log的go语言实现版   
 go-hello hello版本   
 proxy-cache-advanced 代理缓存高级版(memory+redis+disk+腾讯云tcos+阿里云aoss策略)，支持回源防护     
+proxy-cache-advanced 增加AI prompt请求响应缓存（适配SSE流式响应）   
 grpc-web-advanced grpc-web高级版本 浏览器可跨域http->grpc，可挂载远程proto文件，同节点多个worker共享proto缓存   
 grpc-gateway-advanced grpc-gateway高级版,可挂载远程proto文件，同节点多个worker共享proto缓存   
 response-gzip gzip响应插件，支持配置gzip压缩级别和最小压缩长度
@@ -26,7 +27,7 @@ sh docker-build.sh
 [![plugins](plugins.png)](https://gitee.com/kelvins-io)   
 **proxy-cache-advanced**
 支持回源逻辑异步在queue处理，支持配置防缓存穿透开关+redis-lock策略+resty-lock本地策略
-插件策略选择
+插件存储策略选择
 [![plugins](proxy-cache-setting.png)]()   
 postman测试Redis策略
 [![plugins](proxy-cache-result.png)]()   
@@ -34,6 +35,10 @@ redis-gui查看cache-key:result
 [![plugins](proxy-cache-redis.png)]()   
 插件API操作cache
 [![plugins](proxy-cache-search.png)]()
+llm prompt缓存设置
+[![plugins](proxy-cache-llm-config.png)]()
+llm prompt缓存postman
+[![plugins](proxy-cache-llm-postman.png)]()
 
 **grpc-web-advanced**   
 proto 文件支持配置http|https文件地址和本地目录文件   
