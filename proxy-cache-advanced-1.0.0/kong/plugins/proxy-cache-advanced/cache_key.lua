@@ -11,7 +11,16 @@ local insert = table.insert
 local concat = table.concat
 local tostring = tostring
 
-local sha256_hex = require "kong.tools.utils".sha256_hex
+--local sha256_hex = require "kong.tools.utils".sha256_hex
+local sha256_hex
+do
+  local ok, sha256 = pcall(require, "kong.tools.sha256")
+  if ok and sha256 and sha256.sha256_hex then
+    sha256_hex = sha256.sha256_hex
+  else
+    sha256_hex = require("kong.tools.utils").sha256_hex
+  end
+end
 local cjson = require "cjson.safe"
 local json_null = cjson.null
 

@@ -179,7 +179,9 @@ local function remote_store_handler(handler_conf, entries)
   return true
 end
 
--- 根据 conf 构建 queue_conf（Kong 3.4.x kong.tools.queue）
+-- 根据 conf 构建 queue_conf（kong.tools.queue）
+-- Kong 3.7+ enqueue 会 assert concurrency_limit 必须为 number；本插件无 queue schema，
+-- get_plugin_params 不会填该字段。1 = 单 timer 批量消费，与 3.4.x 行为一致。
 local function build_queue_conf(conf)
   local q = get_queue()
   local queue_conf = q.get_plugin_params("proxy-cache-advanced", conf, "proxy-cache-advanced-store")
@@ -189,6 +191,7 @@ local function build_queue_conf(conf)
   queue_conf.max_retry_time       = 60
   queue_conf.initial_retry_delay  = 0.01
   queue_conf.max_retry_delay      = 60
+  queue_conf.concurrency_limit    = tonumber(queue_conf.concurrency_limit) or 1
   return queue_conf
 end
 
@@ -505,7 +508,8 @@ local function persist_cache(conf, ctx, proxy_cache, body)
   if ok_load and q then
     local queue_conf = build_queue_conf(conf)
     local handler_conf = { STRATEGY_PATH = STRATEGY_PATH }
-    local ok_enq, err_enq = q.enqueue(queue_conf, remote_store_handler, handler_conf, {
+    -- enqueue 对非法 queue_conf 使用 assert，必须 pcall 才能回退到 timer
+    local pok, ok_enq, err_enq = pcall(q.enqueue, queue_conf, remote_store_handler, handler_conf, {
       strategy_name = strategy_name,
       strategy_opts = strategy_opts,
       cache_key = key,
@@ -515,10 +519,11 @@ local function persist_cache(conf, ctx, proxy_cache, body)
       lock_backend = proxy_cache.lock_backend,
       lock_conf = proxy_cache.lock_conf,
     })
-    if ok_enq then
+    if pok and ok_enq then
       use_timer = false
     else
-      kong.log.warn("proxy-cache-advanced queue enqueue failed, falling back to timer: ", err_enq)
+      kong.log.warn("proxy-cache-advanced queue enqueue failed, falling back to timer: ",
+                    pok and err_enq or ok_enq)
     end
   else
     kong.log.warn("proxy-cache-advanced kong.tools.queue not available, using timer: ", q)
@@ -752,6 +757,8 @@ function ProxyCacheAdvancedHandler:access(conf)
 
   res.headers["Age"] = floor(time() - res.timestamp)
   res.headers["X-Cache-Status"] = "Hit"
+
+  --kong.log.err("proxy-cache-advanced cache hit, sending body to client: ", res.body)
 
   return kong.response.exit(res.status, res.body, res.headers)
 end
