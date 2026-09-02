@@ -256,12 +256,12 @@ return {
           end
         end
 
-        local llm = config.llm
-        if llm and (llm.enable == true or llm.enable == "true") then
-          if strategies.LOCAL_DATA_STRATEGIES[config.strategy] then
-            return nil, "llm.enable cannot be used with local strategies (memory, disk); use redis, tcos, or aoss"
-          end
-        end
+        --local llm = config.llm
+        --if llm and (llm.enable == true or llm.enable == "true") then
+        --  if strategies.LOCAL_DATA_STRATEGIES[config.strategy] then
+        --    return nil, "llm.enable cannot be used with local strategies (memory, disk); use redis, tcos, or aoss"
+        --  end
+        --end
 
         return true
       end
