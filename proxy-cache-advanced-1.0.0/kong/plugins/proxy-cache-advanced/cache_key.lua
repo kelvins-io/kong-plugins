@@ -237,7 +237,7 @@ local function first_json_field(body, primary, fallbacks)
 end
 
 
--- model_id + prompt hash + temperature (+ stream, to avoid SSE/JSON collisions)
+-- model_id + prompt hash + temperature + top_p (+ stream, to avoid SSE/JSON collisions)
 function _M.llm_digest(raw_body, llm_conf)
   if type(raw_body) ~= "string" or raw_body == "" then
     return nil
@@ -259,6 +259,9 @@ function _M.llm_digest(raw_body, llm_conf)
   local temperature = first_json_field(body, llm_conf.temperature_field or "temperature", {
     "temperature",
   })
+  local top_p = first_json_field(body, llm_conf.top_p_field or "top_p", {
+    "top_p",
+  })
 
   local prompt_hash = ""
   if prompt ~= nil then
@@ -274,8 +277,9 @@ function _M.llm_digest(raw_body, llm_conf)
   local stream = body.stream
   local stream_str = (stream == true or stream == "true") and "1" or "0"
 
-  return fmt("mid=%s:ph=%s:temp=%s:stream=%s",
-             scalar_str(model), prompt_hash, scalar_str(temperature), stream_str)
+  return fmt("mid=%s:ph=%s:temp=%s:top_p=%s:stream=%s",
+             scalar_str(model), prompt_hash, scalar_str(temperature),
+             scalar_str(top_p), stream_str)
 end
 
 

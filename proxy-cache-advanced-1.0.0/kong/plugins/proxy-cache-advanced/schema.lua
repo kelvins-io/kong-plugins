@@ -158,12 +158,13 @@ return {
           }},
           { llm = {
             type = "record",
-            description = "LLM cache mode. When enable is true, the cache key is extended with model_id + prompt hash + temperature parsed from a JSON request body. SSE (text/event-stream) is fully buffered on the first miss and replayed in one shot (still as SSE) on later hits.",
+            description = "LLM cache mode. When enable is true, the cache key is extended with model_id + prompt hash + temperature + top_p parsed from a JSON request body. SSE (text/event-stream) is fully buffered on the first miss and replayed in one shot (still as SSE) on later hits.",
             fields = {
               { enable = { description = "Enable LLM cache-key dimensions and SSE full-response caching. Value: \"true\" or \"false\" (string). When true, strategy must be a remote store (redis, tcos, or aoss); memory and disk are not allowed.", type = "string", one_of = { "true", "false" }, default = "false", required = true } },
               { model_field = { description = "JSON field path for model id (e.g. model or model_id). Falls back to model_id/model if missing.", type = "string", default = "model" } },
               { prompt_field = { description = "JSON field path for prompt (e.g. messages or prompt). Falls back to prompt/messages/input if missing.", type = "string", default = "messages" } },
               { temperature_field = { description = "JSON field path for temperature.", type = "string", default = "temperature" } },
+              { top_p_field = { description = "JSON field path for top_p.", type = "string", default = "top_p" } },
             },
           }},
           { vary_query_params = { description = "Relevant query parameters considered for the cache key. If undefined, all params are taken into consideration.", type = "array",
