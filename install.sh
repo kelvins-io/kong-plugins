@@ -16,3 +16,7 @@ cd -
 cd response-gzip-1.0.0
 luarocks make
 cd -
+
+cd response-ratelimiting-advanced-1.0.0
+luarocks make
+cd -

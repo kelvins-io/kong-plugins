@@ -1,5 +1,5 @@
 ## kong 插件集合集成
-可以挂载到kong route service consumer
+可以挂载到kong route/service/consumer
 
 ## 在线体验
 konga面板   
@@ -8,11 +8,38 @@ http://51pd9106ao09.vicp.fun:42898
 
 web接入   
 https://51pd9106ao09.vicp.fun  
-proxy-cache-advanced插件大模型prompt缓存测试地址
+proxy-cache-advanced插件doubao-seed大模型prompt缓存测试地址
+```shell
+curl --location 'https://51pd9106ao09.vicp.fun/api/doubao-seed' \
+--header 'Content-Type: application/json' \
+--data '{
+    "model": "doubao-seed-2-1-turbo-260628",
+    "messages": [
+        {
+            "content": [
+                {
+                    "image_url": {
+                        "url": "https://ark-project.tos-cn-beijing.ivolces.com/images/view.jpeg"
+                    },
+                    "type": "image_url"
+                },
+                {
+                    "text": "图片主要讲了什么?",
+                    "type": "text"
+                }
+            ],
+            "role": "user"
+        }
+    ],
+    "stream": true
+}'
+```
+
+proxy-cache-advanced+response-ratelimiting-advanced插件deepseek-v4-flash大模型prompt缓存和token额度管理测试地址
 ```shell 
 
 curl --location 'https://51pd9106ao09.vicp.fun/ai/deepseek' \
---header 'X-User-Id: 1111444113434' \
+--header 'X-User-Id: kelvins-io' \
 --header 'Content-Type: application/json' \
 --data '{
   "messages": [
@@ -21,7 +48,7 @@ curl --location 'https://51pd9106ao09.vicp.fun/ai/deepseek' \
       "role": "system"
     },
     {
-      "content": "你好",
+      "content": "分析下https://github.com/kelvins-io/kong-plugins功能",
       "role": "user"
     }
   ],
@@ -53,6 +80,7 @@ proxy-cache-advanced 增加AI prompt请求响应缓存（适配SSE流式响应�
 grpc-web-advanced grpc-web高级版本 浏览器可跨域http->grpc，可挂载远程proto文件，同节点多个worker共享proto缓存   
 grpc-gateway-advanced grpc-gateway高级版,可挂载远程proto文件，同节点多个worker共享proto缓存   
 response-gzip gzip响应插件，支持配置gzip压缩级别和最小压缩长度
+response-ratelimiting-advanced 响应限速高级版，支持AI大模型响应usage token额度限速，也可配合proxy-cache-advanced使用命中缓存时不扣减token额度
 ## 构建镜像
 sh docker-build.sh
 
@@ -75,7 +103,8 @@ llm prompt缓存设置
 [![plugins](proxy-cache-llm-config.png)]()
 llm prompt缓存postman
 [![plugins](proxy-cache-llm-postman.png)]()
-
+response-ratelimiting-advanced 搭配proxy-cache-advanced使用 postman
+[![plugins](response-ratelimiting-advanced.png)]()
 **grpc-web-advanced**   
 proto 文件支持配置http|https文件地址和本地目录文件   
 proto_cache_dir proto缓存目录（若proto为远程文件则下载后缓存到该目录下）   
@@ -84,10 +113,4 @@ proto_cache_dir proto缓存目录（若proto为远程文件则下载后缓存到
 http-->grpc接入   
 [![plugins](grpc-web-postman.png)]()
 ## 交流合作
-可定制化kong网关插件开发   
 1225807604@qq.com，flyingfish_vvip（wechat）
-
-## 赞助列表
-- [x] 赞助商1：xxx公司，赞助金额：xxx元，赞助时间：2024-06-01
-- [x] 赞助商2：yyy公司，赞助金额：yyy元，赞助时间：2024-06-02
-- [x] 赞助商3：zzz公司，赞助金额：zzz元，赞助时间：2024-
