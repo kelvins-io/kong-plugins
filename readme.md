@@ -2,76 +2,10 @@
 可以挂载到kong route/service/consumer
 
 ## 在线体验
-konga面板   
-http://51pd9106ao09.vicp.fun:42898      
-体验用户: konga@kong1234   
-
 web接入   
 https://51pd9106ao09.vicp.fun  
-proxy-cache-advanced插件doubao-seed大模型prompt缓存测试地址
-```shell
-curl --location 'https://51pd9106ao09.vicp.fun/api/doubao-seed' \
---header 'Content-Type: application/json' \
---data '{
-    "model": "doubao-seed-2-1-turbo-260628",
-    "messages": [
-        {
-            "content": [
-                {
-                    "image_url": {
-                        "url": "https://ark-project.tos-cn-beijing.ivolces.com/images/view.jpeg"
-                    },
-                    "type": "image_url"
-                },
-                {
-                    "text": "图片主要讲了什么?",
-                    "type": "text"
-                }
-            ],
-            "role": "user"
-        }
-    ],
-    "stream": true
-}'
-```
+admin/admin123
 
-proxy-cache-advanced+response-ratelimiting-advanced插件deepseek-v4-flash大模型prompt缓存和token额度管理测试地址
-```shell 
-
-curl --location 'https://51pd9106ao09.vicp.fun/ai/deepseek' \
---header 'X-User-Id: kelvins-io' \
---header 'Content-Type: application/json' \
---data '{
-  "messages": [
-    {
-      "content": "You are a helpful assistant",
-      "role": "system"
-    },
-    {
-      "content": "分析下https://github.com/kelvins-io/kong-plugins功能",
-      "role": "user"
-    }
-  ],
-  "model": "deepseek-v4-flash",
-  "thinking": {
-    "type": "enabled"
-  },
-  "reasoning_effort": "high",
-  "max_tokens": 4096,
-  "response_format": {
-    "type": "text"
-  },
-  "stop": null,
-  "stream": true,
-  "stream_options": null,
-  "temperature": 1,
-  "top_p": 1,
-  "tools": null,
-  "tool_choice": "none",
-  "logprobs": false,
-  "top_logprobs": null
-}'
-```
 ## 支持插件
 go-log：file-log的go语言实现版   
 go-hello hello版本   
