@@ -13,8 +13,9 @@ proxy-cache-advanced 代理缓存高级版(memory+redis支持配置分片KEY+dis
 proxy-cache-advanced 增加AI prompt请求响应缓存（适配SSE流式响应）   
 grpc-web-advanced grpc-web高级版本 浏览器可跨域http->grpc，可挂载远程proto文件，同节点多个worker共享proto缓存   
 grpc-gateway-advanced grpc-gateway高级版,可挂载远程proto文件，同节点多个worker共享proto缓存   
-response-gzip gzip响应插件，支持配置gzip压缩级别和最小压缩长度
-response-ratelimiting-advanced 响应限速高级版，支持AI大模型响应usage token额度限速，也可配合proxy-cache-advanced使用命中缓存时不扣减token额度
+response-gzip gzip响应插件，支持配置gzip压缩级别和最小压缩长度   
+response-ratelimiting-advanced 响应限速高级版，支持AI大模型响应usage token额度限速，也可配合proxy-cache-advanced使用命中缓存时不扣减token额度   
+ai-router 功能类似liteLLM   
 ## 构建镜像
 sh docker-build.sh
 

@@ -15,6 +15,7 @@ COPY grpc-web-advanced-1.0.0/kong/plugins/grpc-web-advanced /usr/local/share/lua
 COPY grpc-gateway-advanced-1.0.0/kong/plugins/grpc-gateway-advanced /usr/local/share/lua/5.1/kong/plugins/grpc-gateway-advanced
 COPY response-gzip-1.0.0/kong/plugins/response-gzip /usr/local/share/lua/5.1/kong/plugins/response-gzip
 COPY response-ratelimiting-advanced-1.0.0/kong/plugins/response-ratelimiting-advanced /usr/local/share/lua/5.1/kong/plugins/response-ratelimiting-advanced
+COPY ai-router-1.0.0/kong/plugins/ai-router /usr/local/share/lua/5.1/kong/plugins/ai-router
 
 COPY --from=go-build-stage /app/go-hello/go-hello /usr/local/bin/go-hello
 COPY --from=go-build-stage /app/go-log/go-log /usr/local/bin/go-log
@@ -28,10 +29,10 @@ ENV KONG_PLUGINSERVER_GO_HELLO_QUERY_CMD="/usr/local/bin/go-hello -dump"
 ENV KONG_PLUGINSERVER_GO_LOG_QUERY_CMD="/usr/local/bin/go-log -dump"
 
 
-#ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="tracing_buffer 10m; lua_shared_dict kong_locks 10m;"
-ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="tracing_buffer 10m"
+#ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="tracing_buffer 10m; lua_shared_dict kong_locks 10m; lua_shared_dict ai_router 10m"
+ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="tracing_buffer 10m; lua_shared_dict ai_router 10m"
 ENV KONG_MEM_CACHE_SIZE="512m"
-ENV KONG_PLUGINS="bundled,go-hello,go-log,proxy-cache-advanced,grpc-web-advanced,grpc-gateway-advanced,response-gzip,response-ratelimiting-advanced"
+ENV KONG_PLUGINS="bundled,go-hello,go-log,proxy-cache-advanced,grpc-web-advanced,grpc-gateway-advanced,response-gzip,response-ratelimiting-advanced,ai-router"
 ENV KONG_LUA_PACKAGE_PATH="/home/kong/.luarocks/share/lua/5.1/?.lua;./?.lua;./?/init.lua;"
 USER kong
 CMD ["kong","docker-start"]
