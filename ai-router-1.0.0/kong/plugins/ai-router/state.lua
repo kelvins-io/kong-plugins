@@ -15,9 +15,25 @@ local _M = {}
 
 
 local warned_fallback
+local last_redis_err_at = {}
+local REDIS_ERR_INTERVAL = 5 -- seconds; one err per path, then debug
+
 
 local function use_redis(conf)
   return conf and conf.state_backend == "redis"
+end
+
+
+--- Rate-limit Redis dependency errors so routing hot path does not flood error_log.
+local function log_redis_err(path, err)
+  local t = now()
+  local prev = last_redis_err_at[path]
+  if prev and (t - prev) < REDIS_ERR_INTERVAL then
+    kong.log.debug("ai-router redis ", path, ": ", err)
+    return
+  end
+  last_redis_err_at[path] = t
+  kong.log.err("ai-router redis ", path, ": ", err)
 end
 
 
@@ -30,7 +46,7 @@ local function dict(name)
   if d then
     if not warned_fallback then
       warned_fallback = true
-      kong.log.warn("ai-router: shared dict '", tostring(name),
+      kong.log.err("ai-router shared dict '", tostring(name),
         "' missing; falling back to 'kong'. Add: lua_shared_dict ",
         tostring(name), " 10m;")
     end
@@ -96,7 +112,7 @@ function _M.prefetch(conf, deployments)
 
   local values, err = redis_store.mget(conf, keys)
   if not values then
-    kong.log.warn("ai-router redis prefetch: ", err)
+    log_redis_err("prefetch", err)
     ngx.ctx.ai_router_snap = nil
     return nil
   end
@@ -176,7 +192,7 @@ function _M.is_cooled(conf, dep)
   if use_redis(conf) then
     local v, err = redis_store.get(conf, "cd:" .. id)
     if err then
-      kong.log.warn("ai-router redis is_cooled: ", err)
+      log_redis_err("is_cooled", err)
       return false
     end
     local until_ts = tonumber(v)
@@ -189,7 +205,7 @@ function _M.is_cooled(conf, dep)
 
   local d, err = dict(conf.shared_dict)
   if not d then
-    kong.log.warn("ai-router state: ", err)
+    kong.log.err("ai-router is_cooled dict: ", err)
     return false
   end
   local until_ts = d:get("cd:" .. id)
@@ -207,7 +223,7 @@ function _M.mark_fail(conf, dep)
   if use_redis(conf) then
     local n, err = redis_store.incr(conf, "fail:" .. id, 1, 0, ttl)
     if not n then
-      kong.log.warn("ai-router redis mark_fail: ", err)
+      log_redis_err("mark_fail", err)
       return
     end
     if n >= (conf.allowed_fails or 3) then
@@ -227,12 +243,12 @@ function _M.mark_fail(conf, dep)
 
   local d, err = dict(conf.shared_dict)
   if not d then
-    kong.log.warn("ai-router state: ", err)
+    kong.log.err("ai-router mark_fail dict: ", err)
     return
   end
   local n, serr = d:incr("fail:" .. id, 1, 0, ttl)
   if not n then
-    kong.log.warn("ai-router fail incr: ", serr)
+    kong.log.err("ai-router mark_fail incr: ", serr)
     return
   end
   if n >= (conf.allowed_fails or 3) then
@@ -254,7 +270,7 @@ function _M.mark_success(conf, dep, latency_ms, prompt_tokens, completion_tokens
   -- Serialize rpm/tpm updates against usage-based locked reads/reserves.
   local got_lock = _M.acquire_usage_lock(conf, id)
   if not got_lock then
-    kong.log.warn("ai-router usage lock timeout on mark_success; updating unlocked dep=", id)
+    kong.log.debug("ai-router usage lock timeout on mark_success; updating unlocked dep=", id)
   end
 
   local function release()
@@ -415,7 +431,7 @@ function _M.acquire_usage_lock(conf, id)
         return true
       end
       if ok == nil then
-        kong.log.warn("ai-router usage lock redis: ", err)
+        log_redis_err("usage_lock", err)
         return false
       end
       ngx.sleep(USAGE_LOCK_SLEEP)
@@ -489,7 +505,7 @@ function _M.get_usage(conf, dep, opts)
   if use_lock then
     got_lock = _M.acquire_usage_lock(conf, id)
     if not got_lock then
-      kong.log.warn("ai-router usage lock timeout on get_usage; reading unlocked dep=", id)
+      kong.log.debug("ai-router usage lock timeout on get_usage; reading unlocked dep=", id)
     end
   elseif not fresh then
     local s = snap()
@@ -556,7 +572,7 @@ function _M.usage_try_reserve(conf, dep)
   local id = _M.deployment_id(dep)
   local got_lock = _M.acquire_usage_lock(conf, id)
   if not got_lock then
-    kong.log.warn("ai-router usage lock timeout on reserve; admitting unlocked dep=", id)
+    kong.log.debug("ai-router usage lock timeout on reserve; admitting unlocked dep=", id)
     return true, false
   end
 
@@ -594,7 +610,7 @@ function _M.usage_release_reserve(conf, dep)
   local id = _M.deployment_id(dep)
   local got_lock = _M.acquire_usage_lock(conf, id)
   if not got_lock then
-    kong.log.warn("ai-router usage lock timeout on release; decrementing unlocked dep=", id)
+    kong.log.debug("ai-router usage lock timeout on release; decrementing unlocked dep=", id)
   end
   incr_usage_counter(conf, id, "rpm", -1)
   if got_lock then
@@ -664,7 +680,7 @@ function _M.budget_admit(conf, key_id, max_budget)
   if use_redis(conf) then
     local ok, spend, err = redis_store.try_budget_admit(conf, "spend:" .. key_id, max_budget)
     if ok == nil then
-      kong.log.warn("ai-router budget_admit redis: ", err)
+      log_redis_err("budget_admit", err)
       return false, _M.get_spend(conf, key_id), err or "redis_error"
     end
     return ok, spend, err
@@ -705,7 +721,7 @@ function _M.try_add_spend(conf, key_id, amount, max_budget)
   if use_redis(conf) then
     local ok, spend, err = redis_store.try_charge(conf, "spend:" .. key_id, amount, max_budget)
     if ok == nil then
-      kong.log.warn("ai-router try_add_spend redis: ", err)
+      log_redis_err("try_add_spend", err)
       -- fail closed on redis error when budget is enforced
       if max_budget > 0 then
         return false, _M.get_spend(conf, key_id), err or "redis_error"
@@ -797,7 +813,7 @@ function _M.try_acquire_inflight(conf)
   if use_redis(conf) then
     local ok, n, err = redis_store.try_acquire_inflight(conf, "inflight:global", max, 600)
     if ok == nil then
-      kong.log.warn("ai-router inflight acquire redis: ", err)
+      log_redis_err("inflight_acquire", err)
       return false, _M.get_inflight(conf)
     end
     return ok, n

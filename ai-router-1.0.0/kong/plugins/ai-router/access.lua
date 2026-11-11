@@ -25,6 +25,67 @@ local sub = string.sub
 
 local _M = {}
 
+local LOG_BODY_MAX = 200
+
+
+local function request_id()
+  local rid = ngx.var and ngx.var.request_id
+  if type(rid) == "string" and rid ~= "" then
+    return rid
+  end
+  return "-"
+end
+
+
+local function log_prefix()
+  return "ai-router rid=" .. request_id()
+end
+
+
+local function truncate(s, max)
+  max = max or LOG_BODY_MAX
+  if type(s) ~= "string" then
+    s = tostring(s or "")
+  end
+  if #s <= max then
+    return s
+  end
+  return sub(s, 1, max) .. "..."
+end
+
+
+--- Prefer OpenAI-style error.message; otherwise truncate raw body.
+local function extract_error_message(body)
+  if type(body) ~= "string" or body == "" then
+    return nil
+  end
+  local obj = cjson.decode(body)
+  if type(obj) == "table" then
+    if type(obj.error) == "table" and obj.error.message then
+      return tostring(obj.error.message)
+    end
+    if type(obj.message) == "string" then
+      return obj.message
+    end
+  end
+  return body
+end
+
+
+local function log_final_failure(info)
+  kong.log.warn(log_prefix(),
+    " request failed",
+    " status=", tostring(info.status or "-"),
+    " model=", tostring(info.model or "-"),
+    " provider=", tostring(info.provider or "-"),
+    " deployment=", tostring(info.deployment or "-"),
+    " attempts=", tostring(info.attempts or 0),
+    " latency_ms=", tostring(info.latency_ms or "-"),
+    " fallback_reason=", tostring(info.fallback_reason or "-"),
+    " last_status=", tostring(info.last_status or "-"),
+    " reason=", truncate(info.reason or ""))
+end
+
 
 local function path_matches(path, patterns)
   if not path then
@@ -359,7 +420,13 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
 
     if not status or http_client.is_retryable(status, resp_body) then
       state.mark_fail(conf, dep)
-      return nil, resp_body or rerr or "stream failed", status, resp_body, req
+      local short_err = "stream failed"
+      if status then
+        short_err = "upstream status " .. tostring(status)
+      elseif rerr then
+        short_err = tostring(rerr)
+      end
+      return nil, short_err, status, resp_body, req, latency
     end
     return {
       status = status,
@@ -381,7 +448,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
 
   if not status then
     state.mark_fail(conf, dep)
-    return nil, rerr or "upstream error", nil, nil, req
+    return nil, rerr or "upstream error", nil, nil, req, latency
   end
 
   if status >= 200 and status < 300 then
@@ -407,7 +474,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
 
   if http_client.is_retryable(status, resp_body) then
     state.mark_fail(conf, dep)
-    return nil, "upstream status " .. tostring(status), status, resp_body, req
+    return nil, "upstream status " .. tostring(status), status, resp_body, req, latency
   end
 
   return {
@@ -452,6 +519,9 @@ function _M.execute(conf)
     end
     local ok_budget, spend, max_budget = virtual_keys.check_budget(conf, vk)
     if not ok_budget then
+      kong.log.warn(log_prefix(),
+        " budget exceeded spend=", tostring(spend),
+        " max_budget=", tostring(max_budget))
       return kong.response.exit(429, {
         error = {
           message = "Budget exceeded: spend=" .. tostring(spend)
@@ -473,6 +543,9 @@ function _M.execute(conf)
 
   local ok_inflight, inflight_n = state.try_acquire_inflight(conf)
   if not ok_inflight then
+    kong.log.warn(log_prefix(),
+      " max_inflight exceeded inflight=", tostring(inflight_n),
+      " max=", tostring(conf.max_inflight))
     return kong.response.exit(429, {
       error = {
         message = "Too many in-flight AI requests: " .. tostring(inflight_n)
@@ -550,7 +623,8 @@ function _M.execute(conf)
     else
       local pvec, perr = semantic.embed(conf, prompt_text)
       if not pvec then
-        kong.log.warn("ai-router semantic embed prompt failed: ", perr,
+        kong.log.warn(log_prefix(),
+          " semantic embed prompt failed: ", truncate(perr),
           "; falling back within model group")
       else
         prompt_vec = pvec
@@ -599,6 +673,7 @@ function _M.execute(conf)
   local exclude = {}
   local attempts = 0
   local last_status, last_body, last_headers
+  local last_provider, last_upstream_model, last_deployment, last_latency, last_reason
   local special_kind = nil -- "context_window" | "content_policy" | nil
   local fallback_reason = (request_fallbacks and #request_fallbacks > 0) and "request" or nil
   local chain_seen = { [client_model] = true }
@@ -628,7 +703,8 @@ function _M.execute(conf)
 
       while true do
         if attempts >= max_attempts then
-          kong.log.warn("ai-router max_attempts=", max_attempts, " reached")
+          kong.log.debug(log_prefix(),
+            " max_attempts=", max_attempts, " reached")
           budget_exhausted = true
           break
         end
@@ -643,8 +719,9 @@ function _M.execute(conf)
         end
 
         attempts = attempts + 1
+        local dep_id = state.deployment_id(dep)
 
-        local result, rerr, st, rb = try_deployment(
+        local result, rerr, st, rb, ureq, attempt_latency = try_deployment(
           conf, dep, endpoint, body, client_model, stream, vk,
           { rpm_reserved = rpm_reserved })
 
@@ -672,7 +749,7 @@ function _M.execute(conf)
               model = model_name,
               upstream_model = result.upstream_model,
               provider = result.provider,
-              deployment_id = state.deployment_id(dep),
+              deployment_id = dep_id,
               attempts = attempts,
               strategy = use_semantic and "semantic" or conf.routing_strategy,
               semantic_score = semantic_score,
@@ -695,7 +772,15 @@ function _M.execute(conf)
         last_status = st or (result and result.status)
         last_body = rb or (result and result.body)
         last_headers = result and result.headers
-        exclude[state.deployment_id(dep)] = true
+        last_provider = (result and result.provider)
+          or (ureq and ureq.provider)
+          or last_provider
+        last_upstream_model = (result and result.upstream_model)
+          or (ureq and ureq.upstream_model)
+          or last_upstream_model
+        last_deployment = dep_id
+        last_latency = (result and result.latency) or attempt_latency or last_latency
+        exclude[dep_id] = true
 
         local kind = result and result.error_kind
         if not kind and result and result.non_retryable then
@@ -705,12 +790,26 @@ function _M.execute(conf)
           kind = errors.classify(last_status, last_body)
         end
 
-        kong.log.warn("ai-router attempt failed model=", model_name,
-          " dep=", state.deployment_id(dep),
+        local body_msg = extract_error_message(last_body)
+        local reason = rerr or "upstream error"
+        if last_status and body_msg then
+          reason = tostring(reason) .. ": " .. body_msg
+        elseif not rerr and body_msg then
+          reason = body_msg
+        end
+        last_reason = reason
+
+        kong.log.debug(log_prefix(),
+          " attempt failed model=", model_name,
+          " provider=", tostring(last_provider or "-"),
+          " upstream_model=", tostring(last_upstream_model or "-"),
+          " dep=", dep_id,
           " order=", tostring(order),
-          " err=", tostring(rerr),
+          " latency_ms=", tostring(attempt_latency or (result and result.latency) or "-"),
+          " err=", truncate(rerr or ""),
           " status=", tostring(last_status),
-          " kind=", tostring(kind))
+          " kind=", tostring(kind),
+          " body=", truncate(body_msg or ""))
 
         local function continue_after_fail()
           if retries_left > 0 then
@@ -740,7 +839,7 @@ function _M.execute(conf)
             chain_seen[model_name] = true
             local next_chain = specialized_chain(special_list, chain_seen)
             if #next_chain > 0 then
-              kong.log.notice("ai-router ", kind, " fallback for model=", model_name,
+              kong.log.notice(log_prefix(), " ", kind, " fallback for model=", model_name,
                 " -> ", table.concat(next_chain, ","))
               chain = next_chain
               mi = 1
@@ -762,13 +861,25 @@ function _M.execute(conf)
             break
           end
         elseif result and result.non_retryable then
+          local out_status = result.status
+          log_final_failure({
+            status = out_status,
+            model = model_name,
+            provider = result.provider,
+            deployment = dep_id,
+            attempts = attempts,
+            latency_ms = result.latency,
+            fallback_reason = fallback_reason,
+            last_status = out_status,
+            reason = last_reason,
+          })
           local headers = merge_headers(
             http_client.filter_response_headers(result.headers),
             diag_headers(conf, {
               model = model_name,
               upstream_model = result.upstream_model,
               provider = result.provider,
-              deployment_id = state.deployment_id(dep),
+              deployment_id = dep_id,
               attempts = attempts,
               strategy = use_semantic and "semantic" or conf.routing_strategy,
               semantic_score = semantic_score,
@@ -780,7 +891,7 @@ function _M.execute(conf)
           if not headers["Content-Type"] and not headers["content-type"] then
             headers["Content-Type"] = "application/json"
           end
-          return exit(result.status, result.body, headers)
+          return exit(out_status, result.body, headers)
         else
           if not continue_after_fail() then
             break
@@ -802,27 +913,51 @@ function _M.execute(conf)
   if budget_exhausted then
     message = message .. " (max_attempts=" .. tostring(max_attempts) .. ")"
   end
+  local fb = fallback_reason or special_kind
   if last_body and type(last_body) == "string" and last_body ~= "" then
+    local out_status = last_status or 503
+    log_final_failure({
+      status = out_status,
+      model = client_model,
+      provider = last_provider,
+      deployment = last_deployment,
+      attempts = attempts,
+      latency_ms = last_latency,
+      fallback_reason = fb,
+      last_status = last_status,
+      reason = last_reason or extract_error_message(last_body) or message,
+    })
     local headers = merge_headers(
       http_client.filter_response_headers(last_headers),
       diag_headers(conf, {
         model = client_model,
         attempts = attempts,
         strategy = conf.routing_strategy,
-        fallback_reason = fallback_reason or special_kind,
+        fallback_reason = fb,
       }),
       virtual_keys.budget_headers(conf, vk)
     )
-    return exit(last_status or 503, last_body, headers)
+    return exit(out_status, last_body, headers)
   end
 
+  log_final_failure({
+    status = 503,
+    model = client_model,
+    provider = last_provider,
+    deployment = last_deployment,
+    attempts = attempts,
+    latency_ms = last_latency,
+    fallback_reason = fb,
+    last_status = last_status,
+    reason = last_reason or message,
+  })
   return exit(503, http_client.error_json(503, message, client_model),
     merge_headers(
       diag_headers(conf, {
         model = client_model,
         attempts = attempts,
         strategy = conf.routing_strategy,
-        fallback_reason = fallback_reason or special_kind,
+        fallback_reason = fb,
       }),
       virtual_keys.budget_headers(conf, vk)
     ))

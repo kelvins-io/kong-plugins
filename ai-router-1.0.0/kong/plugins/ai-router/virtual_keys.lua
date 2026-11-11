@@ -12,6 +12,25 @@ local sub = string.sub
 local _M = {}
 
 
+--- Prefer key name; never log the full virtual key secret.
+local function key_label(vk)
+  if not vk then
+    return "-"
+  end
+  if type(vk.name) == "string" and vk.name ~= "" then
+    return vk.name
+  end
+  local k = vk.key or ""
+  if type(k) ~= "string" or k == "" then
+    return "-"
+  end
+  if #k <= 6 then
+    return "key(len=" .. tostring(#k) .. ")"
+  end
+  return sub(k, 1, 6) .. "...(len=" .. tostring(#k) .. ")"
+end
+
+
 local function extract_bearer()
   local auth = kong.request.get_header("authorization")
     or kong.request.get_header("Authorization")
@@ -155,7 +174,7 @@ function _M.charge(conf, vk, dep, prompt_tokens, completion_tokens)
   local max_budget = tonumber(vk.max_budget) or 0
   local ok, spend, err = state.try_add_spend(conf, vk.key, cost, max_budget)
   if not ok then
-    kong.log.warn("ai-router budget charge denied key=", vk.name or vk.key,
+    kong.log.warn("ai-router budget charge denied key=", key_label(vk),
       " cost=", tostring(cost), " spend=", tostring(spend), " err=", tostring(err))
     return false, spend, err or "budget_exceeded"
   end

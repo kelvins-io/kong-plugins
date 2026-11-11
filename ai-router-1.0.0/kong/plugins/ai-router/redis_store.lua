@@ -81,7 +81,7 @@ local function keepalive(red, conf)
   end
   local ok, err = red:set_keepalive(ka_timeout(conf), ka_pool(conf))
   if not ok then
-    kong.log.warn("ai-router redis keepalive: ", err)
+    kong.log.debug("ai-router redis keepalive: ", err)
   end
 end
 

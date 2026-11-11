@@ -65,7 +65,7 @@ local function cache_set(conf, key, vec, ttl)
     -- shared dict value size limited; skip oversized vectors silently
     local ok, err = d:set("emb:" .. key, encoded, ttl)
     if not ok then
-      kong.log.warn("ai-router semantic cache set failed: ", err)
+      kong.log.debug("ai-router semantic cache set failed: ", err)
     end
   end
 end
@@ -265,7 +265,9 @@ function _M.rank(conf, candidates, prompt_vec)
             scored[#scored + 1] = { dep = dep, score = score }
           end
         else
-          kong.log.warn("ai-router semantic embed description failed: ", err)
+          local rid = (ngx.var and ngx.var.request_id) or "-"
+          kong.log.warn("ai-router rid=", tostring(rid),
+            " semantic embed description failed: ", tostring(err))
         end
       end
     end
