@@ -12,6 +12,7 @@ _G.ngx = {
   now = function() return os.time() end,
   sleep = function() end,
   shared = {},
+  ctx = {},
   re = { match = function() return nil end },
   log = function() end,
   print = function() end,
@@ -227,6 +228,119 @@ do
   })
   assert_eq(fb.a[1], "b", "fallback first")
   assert_eq(#fb.a, 2, "fallback len")
+end
+
+
+-- ---- usage lock (local shdict) ----
+do
+  local store = {}
+  local function mock_dict()
+    return {
+      add = function(_, k, v, ttl)
+        if store[k] ~= nil then
+          return false, "exists"
+        end
+        store[k] = { v = v, ttl = ttl }
+        return true
+      end,
+      get = function(_, k)
+        local e = store[k]
+        return e and e.v or nil
+      end,
+      set = function(_, k, v, ttl)
+        store[k] = { v = v, ttl = ttl }
+        return true
+      end,
+      delete = function(_, k)
+        store[k] = nil
+        return true
+      end,
+      incr = function(_, k, delta, init, ttl)
+        local e = store[k]
+        local cur = e and tonumber(e.v) or (init or 0)
+        cur = cur + delta
+        store[k] = { v = cur, ttl = ttl }
+        return cur
+      end,
+    }
+  end
+  ngx.shared.ai_router = mock_dict()
+
+  local state = require "kong.plugins.ai-router.state"
+  local conf = { state_backend = "local", shared_dict = "ai_router" }
+  local dep = {
+    model_name = "gpt-4o",
+    litellm_params = { model = "openai/gpt-4o", order = 1 },
+  }
+  local id = state.deployment_id(dep)
+
+  assert_true(state.acquire_usage_lock(conf, id), "usage lock acquire")
+  assert_false(state.acquire_usage_lock(conf, id), "usage lock held blocks")
+  state.release_usage_lock(conf, id)
+  assert_true(state.acquire_usage_lock(conf, id), "usage lock reacquire")
+  state.release_usage_lock(conf, id)
+
+  state.mark_success(conf, dep, 100, 10, 20)
+  local minute = math.floor(ngx.now() / 60)
+  local rpm_key = "rpm:" .. id .. ":" .. minute
+  local tpm_key = "tpm:" .. id .. ":" .. minute
+  assert_eq(tonumber(store[rpm_key] and store[rpm_key].v), 1, "mark_success rpm")
+  assert_eq(tonumber(store[tpm_key] and store[tpm_key].v), 30, "mark_success tpm")
+
+  local rpm, tpm = state.get_usage(conf, dep, { locked = true })
+  assert_eq(rpm, 1, "locked get_usage rpm")
+  assert_eq(tpm, 30, "locked get_usage tpm")
+  assert_eq(store["usage_lock:" .. id], nil, "lock released after get_usage")
+
+  -- usage reserve / release
+  store = {}
+  ngx.shared.ai_router = mock_dict()
+  local dep_lim = {
+    model_name = "gpt-4o",
+    litellm_params = { model = "openai/gpt-4o", order = 1, rpm = 2, tpm = 1000 },
+  }
+  local id2 = state.deployment_id(dep_lim)
+  local ok_r, reserved = state.usage_try_reserve(conf, dep_lim)
+  assert_true(ok_r, "reserve ok")
+  assert_true(reserved, "reserved flag")
+  assert_eq(tonumber(store["rpm:" .. id2 .. ":" .. minute] and store["rpm:" .. id2 .. ":" .. minute].v), 1, "reserve rpm")
+  state.mark_success(conf, dep_lim, 50, 5, 5, { rpm_reserved = true })
+  assert_eq(tonumber(store["rpm:" .. id2 .. ":" .. minute].v), 1, "no double rpm on success")
+  assert_eq(tonumber(store["tpm:" .. id2 .. ":" .. minute].v), 10, "tpm added")
+
+  ok_r, reserved = state.usage_try_reserve(conf, dep_lim)
+  assert_true(ok_r, "second reserve")
+  state.usage_release_reserve(conf, dep_lim)
+  assert_eq(tonumber(store["rpm:" .. id2 .. ":" .. minute].v), 1, "release rolled back")
+
+  -- fill rpm to ceiling
+  state.usage_try_reserve(conf, dep_lim) -- rpm=2
+  ok_r = state.usage_try_reserve(conf, dep_lim)
+  assert_false(ok_r, "reserve blocked at rpm ceiling")
+
+  -- budget_admit under spend_lock
+  store = {}
+  ngx.shared.ai_router = mock_dict()
+  store["spend:k1"] = { v = 10 }
+  local ok_b, sp = state.budget_admit(conf, "k1", 10)
+  assert_false(ok_b, "admit denied at ceiling")
+  assert_eq(sp, 10, "admit spend")
+  store["spend:k1"] = { v = 9 }
+  ok_b, sp = state.budget_admit(conf, "k1", 10)
+  assert_true(ok_b, "admit under ceiling")
+  assert_eq(sp, 9, "admit current spend")
+
+  -- inflight lock acquire
+  store = {}
+  ngx.shared.ai_router = mock_dict()
+  local ok_i, n = state.try_acquire_inflight({ state_backend = "local", shared_dict = "ai_router", max_inflight = 1 })
+  assert_true(ok_i, "inflight first")
+  assert_eq(n, 1, "inflight n")
+  ok_i, n = state.try_acquire_inflight({ state_backend = "local", shared_dict = "ai_router", max_inflight = 1 })
+  assert_false(ok_i, "inflight full")
+  state.release_inflight({ state_backend = "local", shared_dict = "ai_router", max_inflight = 1 })
+
+  ngx.shared.ai_router = nil
 end
 
 

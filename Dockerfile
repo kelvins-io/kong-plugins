@@ -30,8 +30,8 @@ ENV KONG_PLUGINSERVER_GO_LOG_QUERY_CMD="/usr/local/bin/go-log -dump"
 
 
 #ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="tracing_buffer 10m; lua_shared_dict kong_locks 10m; lua_shared_dict ai_router 10m"
-ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="tracing_buffer 10m; lua_shared_dict ai_router 10m"
-ENV KONG_MEM_CACHE_SIZE="512m"
+#ENV KONG_NGINX_HTTP_LUA_SHARED_DICT="lua_shared_dict ai_router 10m"
+ENV KONG_MEM_CACHE_SIZE="256m"
 ENV KONG_PLUGINS="bundled,go-hello,go-log,proxy-cache-advanced,grpc-web-advanced,grpc-gateway-advanced,response-gzip,response-ratelimiting-advanced,ai-router"
 ENV KONG_LUA_PACKAGE_PATH="/home/kong/.luarocks/share/lua/5.1/?.lua;./?.lua;./?/init.lua;"
 USER kong

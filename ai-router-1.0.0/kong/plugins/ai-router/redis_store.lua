@@ -180,6 +180,35 @@ function _M.del(conf, key)
 end
 
 
+--- Acquire a short-lived lock: SET key NX EX ttl.
+--- Returns true (acquired), false (held by other), or nil, err (redis error).
+function _M.try_lock(conf, key, ttl)
+  local red, err = connect(conf)
+  if not red then
+    return nil, err
+  end
+  ttl = tonumber(ttl) or 1
+  if ttl < 1 then
+    ttl = 1
+  end
+  local full = full_key(conf, key)
+  local res, serr = red:set(full, "1", "NX", "EX", ttl)
+  keepalive(red, conf)
+  if serr then
+    return nil, serr
+  end
+  if res == null or res == nil then
+    return false
+  end
+  return true
+end
+
+
+function _M.unlock(conf, key)
+  return _M.del(conf, key)
+end
+
+
 --- INCRBY + optional EXPIRE in one pipeline (1 RTT).
 --- Missing key is created by Redis INCRBY; `init` kept for API compat (unused).
 function _M.incr(conf, key, delta, init, ttl) -- luacheck: ignore 212
@@ -269,6 +298,82 @@ function _M.try_charge(conf, key, cost, max_budget)
     return false, spend, "budget_exceeded"
   end
   return true, spend
+end
+
+
+-- Atomic budget gate: deny when spend >= max_budget (same key as charge).
+local ADMIT_SCRIPT = [[
+local key = KEYS[1]
+local maxb = tonumber(ARGV[1]) or 0
+local spend = tonumber(redis.call('GET', key) or '0') or 0
+if maxb > 0 and spend >= maxb then
+  return {1, spend}
+end
+return {0, spend}
+]]
+
+
+--- Returns ok, spend, err — ok=false when already at/over max_budget.
+function _M.try_budget_admit(conf, key, max_budget)
+  local red, err = connect(conf)
+  if not red then
+    return nil, nil, err
+  end
+  local full = full_key(conf, key)
+  local res, eerr = red:eval(ADMIT_SCRIPT, 1, full, tonumber(max_budget) or 0)
+  keepalive(red, conf)
+  if not res then
+    return nil, nil, eerr
+  end
+  local code = tonumber(res[1])
+  local spend = tonumber(res[2]) or 0
+  if code == 1 then
+    return false, spend, "budget_exceeded"
+  end
+  return true, spend
+end
+
+
+-- Atomic inflight acquire: INCR then DECR if over max (single Lua RTT).
+local INFLIGHT_ACQUIRE_SCRIPT = [[
+local key = KEYS[1]
+local maxb = tonumber(ARGV[1]) or 0
+local ttl = tonumber(ARGV[2]) or 600
+local n = tonumber(redis.call('INCR', key))
+if ttl > 0 then
+  redis.call('EXPIRE', key, ttl)
+end
+if maxb > 0 and n > maxb then
+  n = tonumber(redis.call('DECR', key))
+  if n < 0 then
+    redis.call('SET', key, '0')
+    n = 0
+  end
+  return {0, n}
+end
+return {1, n}
+]]
+
+
+--- Returns ok, current_count, err
+function _M.try_acquire_inflight(conf, key, max_inflight, ttl)
+  local red, err = connect(conf)
+  if not red then
+    return nil, nil, err
+  end
+  local full = full_key(conf, key)
+  local res, eerr = red:eval(
+    INFLIGHT_ACQUIRE_SCRIPT, 1, full,
+    tonumber(max_inflight) or 0,
+    tonumber(ttl) or 600
+  )
+  keepalive(red, conf)
+  if not res then
+    return nil, nil, eerr
+  end
+  local code = tonumber(res[1])
+  local n = tonumber(res[2]) or 0
+  return code == 1, n
 end
 
 

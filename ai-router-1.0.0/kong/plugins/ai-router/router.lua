@@ -158,13 +158,21 @@ local function cost_based(candidates)
 end
 
 
-local function usage_based(conf, candidates)
+local function usage_score(p, rpm, tpm)
+  local rpm_ratio = p.rpm and (rpm / p.rpm) or 0
+  local tpm_ratio = p.tpm and (tpm / p.tpm) or 0
+  return rpm_ratio > tpm_ratio and rpm_ratio or tpm_ratio
+end
+
+
+local function usage_based(conf, candidates, no_reserve)
   -- Prefer deployments furthest from rpm/tpm ceiling; skip those over limit.
+  -- Score with locked reads, then try atomic rpm reserve in score order.
   local eligible = {}
   for i = 1, #candidates do
     local dep = candidates[i]
     local p = params(dep)
-    local rpm, tpm = state.get_usage(conf, dep)
+    local rpm, tpm = state.get_usage(conf, dep, { locked = true })
     local over = false
     if p.rpm and rpm >= p.rpm then
       over = true
@@ -173,26 +181,38 @@ local function usage_based(conf, candidates)
       over = true
     end
     if not over then
-      eligible[#eligible + 1] = { dep = dep, rpm = rpm, tpm = tpm, p = p }
+      eligible[#eligible + 1] = {
+        dep = dep,
+        rpm = rpm,
+        tpm = tpm,
+        p = p,
+        score = usage_score(p, rpm, tpm),
+      }
     end
   end
 
   if #eligible == 0 then
-    return simple_shuffle(candidates)
+    -- All over configured ceilings: last-resort shuffle without reserve.
+    return simple_shuffle(candidates), false
   end
 
-  local best, best_score
+  sort(eligible, function(a, b)
+    return a.score < b.score
+  end)
+
+  if no_reserve then
+    return eligible[1].dep, false
+  end
+
   for i = 1, #eligible do
-    local e = eligible[i]
-    local rpm_ratio = e.p.rpm and (e.rpm / e.p.rpm) or 0
-    local tpm_ratio = e.p.tpm and (e.tpm / e.p.tpm) or 0
-    local score = rpm_ratio > tpm_ratio and rpm_ratio or tpm_ratio
-    if not best or score < best_score then
-      best = e.dep
-      best_score = score
+    local dep = eligible[i].dep
+    local ok, reserved = state.usage_try_reserve(conf, dep)
+    if ok then
+      return dep, reserved
     end
   end
-  return best
+
+  return simple_shuffle(candidates), false
 end
 
 
@@ -242,6 +262,7 @@ end
 --- opts.prompt_vec: embedding vector for semantic strategy
 --- opts.prefer_dep: preferred deployment to try first (from cross-model resolve)
 --- opts.semantic_score: score from cross-model resolve (returned with prefer_dep)
+--- Returns: dep, err, order, score, rpm_reserved
 function _M.pick(conf, deployments, exclude, opts)
   opts = opts or {}
   local available = filter_available(conf, deployments, exclude)
@@ -249,11 +270,26 @@ function _M.pick(conf, deployments, exclude, opts)
     return nil, "no available deployments"
   end
 
+  local strategy = conf.routing_strategy or "simple-shuffle"
+
+  local no_reserve = opts.no_reserve == true
+
   if opts.prefer_dep then
     local pid = state.deployment_id(opts.prefer_dep)
     for i = 1, #available do
       if state.deployment_id(available[i]) == pid then
-        return available[i], nil, tonumber(params(available[i]).order) or 1, opts.semantic_score
+        local dep = available[i]
+        local order = tonumber(params(dep).order) or 1
+        if strategy == "usage-based-routing" and not no_reserve then
+          local ok, reserved = state.usage_try_reserve(conf, dep)
+          if ok then
+            return dep, nil, order, opts.semantic_score, reserved
+          end
+          -- prefer_dep over limit: fall through to normal pick
+        else
+          return dep, nil, order, opts.semantic_score, false
+        end
+        break
       end
     end
   end
@@ -261,9 +297,9 @@ function _M.pick(conf, deployments, exclude, opts)
   local by_order, orders = group_by_order(available)
   for _, o in ipairs(orders) do
     local candidates = by_order[o]
-    local strategy = conf.routing_strategy or "simple-shuffle"
     local chosen
     local score
+    local rpm_reserved = false
 
     if strategy == "least-busy" then
       chosen = least_busy(conf, candidates)
@@ -272,7 +308,7 @@ function _M.pick(conf, deployments, exclude, opts)
     elseif strategy == "cost-based-routing" then
       chosen = cost_based(candidates)
     elseif strategy == "usage-based-routing" then
-      chosen = usage_based(conf, candidates)
+      chosen, rpm_reserved = usage_based(conf, candidates, no_reserve)
     elseif strategy == "semantic" then
       if opts.prompt_vec then
         chosen, score = semantic.pick_best(conf, candidates, opts.prompt_vec)
@@ -285,7 +321,7 @@ function _M.pick(conf, deployments, exclude, opts)
     end
 
     if chosen then
-      return chosen, nil, o, score
+      return chosen, nil, o, score, rpm_reserved and true or false
     end
   end
 

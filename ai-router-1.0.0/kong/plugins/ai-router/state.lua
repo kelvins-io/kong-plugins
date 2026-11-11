@@ -61,7 +61,11 @@ end
 
 
 local function snap()
-  return ngx.ctx.ai_router_snap
+  local ctx = ngx.ctx
+  if type(ctx) ~= "table" then
+    return nil
+  end
+  return ctx.ai_router_snap
 end
 
 
@@ -239,16 +243,36 @@ function _M.mark_fail(conf, dep)
 end
 
 
-function _M.mark_success(conf, dep, latency_ms, prompt_tokens, completion_tokens)
+--- opts.rpm_reserved=true: rpm already incremented by usage_try_reserve; only add tpm/latency.
+function _M.mark_success(conf, dep, latency_ms, prompt_tokens, completion_tokens, opts)
+  opts = opts or {}
+  local rpm_reserved = opts.rpm_reserved == true
   local id = _M.deployment_id(dep)
   local minute = floor(now() / 60)
   local tokens = (tonumber(prompt_tokens) or 0) + (tonumber(completion_tokens) or 0)
 
+  -- Serialize rpm/tpm updates against usage-based locked reads/reserves.
+  local got_lock = _M.acquire_usage_lock(conf, id)
+  if not got_lock then
+    kong.log.warn("ai-router usage lock timeout on mark_success; updating unlocked dep=", id)
+  end
+
+  local function release()
+    if got_lock then
+      _M.release_usage_lock(conf, id)
+      got_lock = false
+    end
+  end
+
   if use_redis(conf) then
     local ops = {
       { op = "del", key = "fail:" .. id },
-      { op = "incrby", key = "rpm:" .. id .. ":" .. minute, delta = 1, ttl = 120 },
     }
+    if not rpm_reserved then
+      ops[#ops + 1] = {
+        op = "incrby", key = "rpm:" .. id .. ":" .. minute, delta = 1, ttl = 120,
+      }
+    end
     if tokens > 0 then
       ops[#ops + 1] = {
         op = "incrby", key = "tpm:" .. id .. ":" .. minute, delta = tokens, ttl = 120,
@@ -268,7 +292,9 @@ function _M.mark_success(conf, dep, latency_ms, prompt_tokens, completion_tokens
       ops[#ops + 1] = { op = "setex", key = "lat:" .. id, value = ema, ttl = 3600 }
     end
 
-    redis_store.pipeline(conf, ops)
+    if #ops > 0 then
+      redis_store.pipeline(conf, ops)
+    end
     local_cd_clear(conf, id)
 
     local s = snap()
@@ -277,14 +303,18 @@ function _M.mark_success(conf, dep, latency_ms, prompt_tokens, completion_tokens
       if ema then
         s[id].lat = ema
       end
-      s[id].rpm = (s[id].rpm or 0) + 1
+      if not rpm_reserved then
+        s[id].rpm = (s[id].rpm or 0) + 1
+      end
       s[id].tpm = (s[id].tpm or 0) + tokens
     end
+    release()
     return
   end
 
   local d = dict(conf.shared_dict)
   if not d then
+    release()
     return
   end
   d:delete("fail:" .. id)
@@ -293,10 +323,13 @@ function _M.mark_success(conf, dep, latency_ms, prompt_tokens, completion_tokens
     local prev = tonumber(d:get(lk)) or latency_ms
     d:set(lk, prev * 0.7 + latency_ms * 0.3, 3600)
   end
-  d:incr("rpm:" .. id .. ":" .. minute, 1, 0, 120)
+  if not rpm_reserved then
+    d:incr("rpm:" .. id .. ":" .. minute, 1, 0, 120)
+  end
   if tokens > 0 then
     d:incr("tpm:" .. id .. ":" .. minute, tokens, 0, 120)
   end
+  release()
 end
 
 
@@ -362,15 +395,68 @@ function _M.incr_busy(conf, dep, delta)
 end
 
 
-function _M.get_usage(conf, dep)
-  local id = _M.deployment_id(dep)
-  local s = snap()
-  if s and s[id] then
-    return s[id].rpm or 0, s[id].tpm or 0
+--- Per-deployment lock for rpm/tpm read+write (usage-based-routing).
+--- Local: shdict add NX; Redis: SET NX EX. Mirrors spend_lock pattern.
+local USAGE_LOCK_TTL = 1
+local USAGE_LOCK_TRIES = 50
+local USAGE_LOCK_SLEEP = 0.001
+
+
+function _M.acquire_usage_lock(conf, id)
+  if not id or id == "" then
+    return false
   end
+  local lock_key = "usage_lock:" .. id
+
+  if use_redis(conf) then
+    for _ = 1, USAGE_LOCK_TRIES do
+      local ok, err = redis_store.try_lock(conf, lock_key, USAGE_LOCK_TTL)
+      if ok == true then
+        return true
+      end
+      if ok == nil then
+        kong.log.warn("ai-router usage lock redis: ", err)
+        return false
+      end
+      ngx.sleep(USAGE_LOCK_SLEEP)
+    end
+    return false
+  end
+
+  local d = dict(conf.shared_dict)
+  if not d then
+    return false
+  end
+  for _ = 1, USAGE_LOCK_TRIES do
+    local got = d:add(lock_key, true, USAGE_LOCK_TTL)
+    if got then
+      return true
+    end
+    ngx.sleep(USAGE_LOCK_SLEEP)
+  end
+  return false
+end
+
+
+function _M.release_usage_lock(conf, id)
+  if not id or id == "" then
+    return
+  end
+  local lock_key = "usage_lock:" .. id
+  if use_redis(conf) then
+    redis_store.unlock(conf, lock_key)
+    return
+  end
+  local d = dict(conf.shared_dict)
+  if d then
+    d:delete(lock_key)
+  end
+end
+
+
+local function read_usage_fresh(conf, id)
   local minute = floor(now() / 60)
   if use_redis(conf) then
-    -- one MGET for both counters
     local values = redis_store.mget(conf, {
       "rpm:" .. id .. ":" .. minute,
       "tpm:" .. id .. ":" .. minute,
@@ -387,6 +473,133 @@ function _M.get_usage(conf, dep)
   local rpm = tonumber(d:get("rpm:" .. id .. ":" .. minute)) or 0
   local tpm = tonumber(d:get("tpm:" .. id .. ":" .. minute)) or 0
   return rpm, tpm
+end
+
+
+--- opts.locked=true: acquire usage lock, bypass snap, fresh read (for usage-based).
+--- opts.fresh=true: bypass snap without locking.
+--- Lock timeout → still fresh-read unlocked (best effort) so routing can proceed.
+function _M.get_usage(conf, dep, opts)
+  opts = opts or {}
+  local id = _M.deployment_id(dep)
+  local use_lock = opts.locked == true
+  local fresh = use_lock or opts.fresh == true
+  local got_lock = false
+
+  if use_lock then
+    got_lock = _M.acquire_usage_lock(conf, id)
+    if not got_lock then
+      kong.log.warn("ai-router usage lock timeout on get_usage; reading unlocked dep=", id)
+    end
+  elseif not fresh then
+    local s = snap()
+    if s and s[id] then
+      return s[id].rpm or 0, s[id].tpm or 0
+    end
+  end
+
+  local rpm, tpm = read_usage_fresh(conf, id)
+
+  local s = snap()
+  if s and s[id] then
+    s[id].rpm = rpm
+    s[id].tpm = tpm
+  end
+
+  if got_lock then
+    _M.release_usage_lock(conf, id)
+  end
+  return rpm, tpm
+end
+
+
+local function incr_usage_counter(conf, id, kind, delta, minute)
+  minute = minute or floor(now() / 60)
+  local key = kind .. ":" .. id .. ":" .. minute
+  if use_redis(conf) then
+    local n = redis_store.incr(conf, key, delta, 0, 120)
+    if n and n < 0 then
+      redis_store.set(conf, key, 0, 120)
+      n = 0
+    end
+    local s = snap()
+    if s and s[id] and kind == "rpm" then
+      s[id].rpm = n or 0
+    elseif s and s[id] and kind == "tpm" then
+      s[id].tpm = n or 0
+    end
+    return n or 0
+  end
+  local d = dict(conf.shared_dict)
+  if not d then
+    return 0
+  end
+  local n = d:incr(key, delta, 0, 120)
+  if n and n < 0 then
+    d:set(key, 0, 120)
+    n = 0
+  end
+  return n or 0
+end
+
+
+--- Atomically check rpm/tpm ceilings and pre-increment rpm (request slot).
+--- Returns ok, reserved (reserved=true → release on failure; skip rpm incr in mark_success).
+function _M.usage_try_reserve(conf, dep)
+  local p = (dep and dep.litellm_params) or {}
+  local has_rpm = p.rpm and tonumber(p.rpm) and tonumber(p.rpm) > 0
+  local has_tpm = p.tpm and tonumber(p.tpm) and tonumber(p.tpm) > 0
+  if not has_rpm and not has_tpm then
+    return true, false
+  end
+
+  local id = _M.deployment_id(dep)
+  local got_lock = _M.acquire_usage_lock(conf, id)
+  if not got_lock then
+    kong.log.warn("ai-router usage lock timeout on reserve; admitting unlocked dep=", id)
+    return true, false
+  end
+
+  local rpm, tpm = read_usage_fresh(conf, id)
+  local rpm_lim = tonumber(p.rpm)
+  local tpm_lim = tonumber(p.tpm)
+  if has_rpm and rpm >= rpm_lim then
+    _M.release_usage_lock(conf, id)
+    return false, false
+  end
+  if has_tpm and tpm >= tpm_lim then
+    _M.release_usage_lock(conf, id)
+    return false, false
+  end
+
+  local reserved = false
+  if has_rpm then
+    incr_usage_counter(conf, id, "rpm", 1)
+    reserved = true
+    local s = snap()
+    if s and s[id] then
+      s[id].rpm = (s[id].rpm or rpm) + 1
+    end
+  end
+
+  _M.release_usage_lock(conf, id)
+  return true, reserved
+end
+
+
+function _M.usage_release_reserve(conf, dep)
+  if not dep then
+    return
+  end
+  local id = _M.deployment_id(dep)
+  local got_lock = _M.acquire_usage_lock(conf, id)
+  if not got_lock then
+    kong.log.warn("ai-router usage lock timeout on release; decrementing unlocked dep=", id)
+  end
+  incr_usage_counter(conf, id, "rpm", -1)
+  if got_lock then
+    _M.release_usage_lock(conf, id)
+  end
 end
 
 
@@ -437,6 +650,49 @@ function _M.budget_charge_decision(spend, cost, max_budget)
     return false, spend
   end
   return true, spend + cost
+end
+
+
+--- Atomic pre-flight budget gate (same key / lock as charge).
+--- Returns ok, spend, err — ok=false when spend >= max_budget.
+function _M.budget_admit(conf, key_id, max_budget)
+  max_budget = tonumber(max_budget) or 0
+  if max_budget <= 0 then
+    return true, _M.get_spend(conf, key_id)
+  end
+
+  if use_redis(conf) then
+    local ok, spend, err = redis_store.try_budget_admit(conf, "spend:" .. key_id, max_budget)
+    if ok == nil then
+      kong.log.warn("ai-router budget_admit redis: ", err)
+      return false, _M.get_spend(conf, key_id), err or "redis_error"
+    end
+    return ok, spend, err
+  end
+
+  local d = dict(conf.shared_dict)
+  if not d then
+    return false, 0, "missing shared dict"
+  end
+
+  local lock_key = "spend_lock:" .. key_id
+  local spend_key = "spend:" .. key_id
+  for _ = 1, 25 do
+    local got = d:add(lock_key, true, 1)
+    if got then
+      local cur = tonumber(d:get(spend_key)) or 0
+      local ok = cur < max_budget
+      d:delete(lock_key)
+      if not ok then
+        return false, cur, "budget_exceeded"
+      end
+      return true, cur
+    end
+    ngx.sleep(0.001)
+  end
+
+  local cur = tonumber(d:get(spend_key)) or 0
+  return false, cur, "budget_lock_timeout"
 end
 
 
@@ -531,11 +787,44 @@ end
 
 
 --- Try acquire one inflight slot. Returns ok, current_count
+--- Redis: single Lua INCR+cap; local: shdict lock then check-and-incr.
 function _M.try_acquire_inflight(conf)
   local max = tonumber(conf.max_inflight) or 0
   if max <= 0 then
     return true, 0
   end
+
+  if use_redis(conf) then
+    local ok, n, err = redis_store.try_acquire_inflight(conf, "inflight:global", max, 600)
+    if ok == nil then
+      kong.log.warn("ai-router inflight acquire redis: ", err)
+      return false, _M.get_inflight(conf)
+    end
+    return ok, n
+  end
+
+  local d = dict(conf.shared_dict)
+  if not d then
+    return false, 0
+  end
+
+  local lock_key = "inflight_lock:global"
+  for _ = 1, 25 do
+    local got = d:add(lock_key, true, 1)
+    if got then
+      local cur = tonumber(d:get("inflight:global")) or 0
+      if cur >= max then
+        d:delete(lock_key)
+        return false, cur
+      end
+      local n = d:incr("inflight:global", 1, 0, 600)
+      d:delete(lock_key)
+      return true, n or (cur + 1)
+    end
+    ngx.sleep(0.001)
+  end
+
+  -- lock timeout: fall back to atomic incr+compensate
   local n = _M.incr_inflight(conf, 1)
   if n > max then
     _M.incr_inflight(conf, -1)

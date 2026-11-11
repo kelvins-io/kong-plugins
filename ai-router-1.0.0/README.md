@@ -266,9 +266,9 @@ curl -H "Authorization: Bearer sk-team-a" http://kong:8000/v1/models
 | `drop_params` | `true` | 转发前丢弃不兼容参数 |
 | `return_model_in_response` | `true` | 响应 `model` 字段使用客户端别名 |
 | `response_headers` | `true` | 是否写入诊断响应头 |
-| `state_backend` | `local` | `local`（共享内存）或 `redis` |
+| `state_backend` | `redis` | `redis`（跨节点，默认）或 `local`（共享内存） |
 | `shared_dict` | `ai_router` | `lua_shared_dict` 名称 |
-| `redis` | — | Redis 连接（`state_backend=redis` 时 `host` 必填） |
+| `redis` | — | Redis 连接（默认后端为 redis，**`host` 必填**；仅 `state_backend=local` 时可省略） |
 | `enable_virtual_keys` | `false` | 启用虚拟 Key 鉴权与预算 |
 | `master_key` | — | 主 Key |
 | `virtual_keys` | `[]` | 虚拟 Key 列表 |
@@ -363,6 +363,10 @@ OpenAI / Azure / 兼容网关原样透传。
 8. Provider / Redis 连接池：`keepalive_timeout` + `keepalive_pool_size`；选路在 Redis 模式下一次 MGET 预取 cooldown/busy/latency/usage，并用短 TTL 本地缓存 cooldown。
 9. 重试受 `num_retries` / `stream_num_retries` / `max_attempts` / `max_retry_backoff` 约束；连接错误不再额外 sleep。
 10. `ssl_verify` 默认 `true`；`max_inflight>0` 时全局并发闸门保护 worker 连接槽。
+11. **配额原子化（按优先级）**  
+    - 虚拟 Key 预算：入口 `check_budget` 与扣费 `charge` 共用 `spend_lock` / Redis EVAL（`spend >= max_budget` 拒入）；扣费仍保证 spend 不超过 `max_budget`。近限额并发仍可能先打上游、后扣费失败（只记日志）。  
+    - `usage-based-routing`：选路时锁定读用量，并 **预扣 rpm**；成功只补 tpm/延迟，失败回滚预扣。仅配 tpm、未配 rpm 时仍只能做门禁检查、无法预扣 token。  
+    - `max_inflight`：Redis 单次 Lua `INCR`+封顶；local 下 shdict 锁后 check-and-incr。
 
 ## 测试
 
@@ -370,4 +374,4 @@ OpenAI / Azure / 兼容网关原样透传。
 cd ai-router-1.0.0 && lua spec/unit_spec.lua
 ```
 
-覆盖：超时归一化、错误分类、预算决策、虚拟 Key 模型匹配、Fallback 索引、SSE usage、Provider 前缀解析。
+覆盖：超时归一化、错误分类、预算决策、虚拟 Key 模型匹配、Fallback 索引、SSE usage、Provider 前缀解析、usage 锁/预扣、budget_admit、inflight 占槽。

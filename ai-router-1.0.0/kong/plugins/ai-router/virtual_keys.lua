@@ -101,6 +101,7 @@ function _M.model_allowed(vk, model)
 end
 
 
+--- Pre-flight gate using the same atomic path as charge (spend_lock / Redis EVAL).
 function _M.check_budget(conf, vk)
   if not vk or vk.is_master then
     return true
@@ -109,9 +110,9 @@ function _M.check_budget(conf, vk)
   if not max_budget or max_budget <= 0 then
     return true
   end
-  local spend = state.get_spend(conf, vk.key)
-  if spend >= max_budget then
-    return false, spend, max_budget
+  local ok, spend, err = state.budget_admit(conf, vk.key, max_budget)
+  if not ok then
+    return false, spend, max_budget, err
   end
   return true, spend, max_budget
 end

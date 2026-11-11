@@ -469,9 +469,9 @@ return {
               required = true,
           }},
           { state_backend = {
-              description = "状态后端：local（共享内存）或 redis（跨节点）。",
+              description = "状态后端：redis（跨节点，默认）或 local（共享内存）。",
               type = "string",
-              default = "local",
+              default = "redis",
               one_of = { "local", "redis" },
               required = true,
           }},

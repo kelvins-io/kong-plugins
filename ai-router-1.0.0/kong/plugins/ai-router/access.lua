@@ -294,7 +294,12 @@ local function http_opts(conf, dep)
 end
 
 
-local function try_deployment(conf, dep, endpoint, body, client_model, stream, vk)
+--- opts.rpm_reserved: usage-based pre-incremented rpm; skip rpm in mark_success.
+local function try_deployment(conf, dep, endpoint, body, client_model, stream, vk, opts)
+  opts = opts or {}
+  local rpm_reserved = opts.rpm_reserved == true
+  local success_opts = { rpm_reserved = rpm_reserved }
+
   local req, err = providers.build_request(conf, dep, endpoint, body, client_model)
   if not req then
     return nil, err
@@ -336,7 +341,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
     if streamed then
       local pt = (usage and usage.prompt_tokens) or 0
       local ct = (usage and usage.completion_tokens) or 0
-      state.mark_success(conf, dep, latency, pt, ct)
+      state.mark_success(conf, dep, latency, pt, ct, success_opts)
       if conf.enable_virtual_keys then
         virtual_keys.charge(conf, vk, dep, pt, ct)
       end
@@ -348,6 +353,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
         prompt_tokens = pt,
         completion_tokens = ct,
         dep = dep,
+        rpm_reserved = rpm_reserved,
       }
     end
 
@@ -365,6 +371,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
       non_retryable = true,
       error_kind = errors.classify(status, resp_body),
       dep = dep,
+      rpm_reserved = rpm_reserved,
     }
   end
 
@@ -379,7 +386,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
 
   if status >= 200 and status < 300 then
     local pt, ct = extract_usage(resp_body)
-    state.mark_success(conf, dep, latency, pt, ct)
+    state.mark_success(conf, dep, latency, pt, ct, success_opts)
     status, headers, resp_body = providers.normalize_response(
       req.provider, endpoint, status, headers, resp_body, client_model, conf)
     -- re-extract after normalize (usage preserved)
@@ -394,6 +401,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
       prompt_tokens = pt,
       completion_tokens = ct,
       dep = dep,
+      rpm_reserved = rpm_reserved,
     }
   end
 
@@ -412,6 +420,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
     non_retryable = true,
     error_kind = errors.classify(status, resp_body),
     dep = dep,
+    rpm_reserved = rpm_reserved,
   }
 end
 
@@ -624,7 +633,7 @@ function _M.execute(conf)
           break
         end
 
-        local dep, _, order, score = router.pick(conf, deployments, exclude, opts)
+        local dep, _, order, score, rpm_reserved = router.pick(conf, deployments, exclude, opts)
         if not dep then
           break
         end
@@ -636,7 +645,8 @@ function _M.execute(conf)
         attempts = attempts + 1
 
         local result, rerr, st, rb = try_deployment(
-          conf, dep, endpoint, body, client_model, stream, vk)
+          conf, dep, endpoint, body, client_model, stream, vk,
+          { rpm_reserved = rpm_reserved })
 
         if result and result.streamed then
           release_inflight()
@@ -677,6 +687,11 @@ function _M.execute(conf)
           return exit(result.status, result.body, headers)
         end
 
+        -- Failed attempt: roll back usage-based rpm reserve if any.
+        if rpm_reserved then
+          state.usage_release_reserve(conf, dep)
+        end
+
         last_status = st or (result and result.status)
         last_body = rb or (result and result.body)
         last_headers = result and result.headers
@@ -709,7 +724,7 @@ function _M.execute(conf)
             retries_left = per_dep_retries
             backoff(conf, attempts, rerr)
             return true
-          elseif router.pick(conf, deployments, exclude) then
+          elseif router.pick(conf, deployments, exclude, { no_reserve = true }) then
             retries_left = per_dep_retries
             backoff(conf, attempts, rerr)
             return true
