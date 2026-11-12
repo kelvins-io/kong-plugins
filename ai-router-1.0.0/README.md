@@ -19,6 +19,7 @@ Kong 插件：对齐 [LiteLLM Router](https://docs.litellm.ai/docs/routing) 的�
 | 跨节点状态 | `state_backend=redis`（cooldown / busy / latency / rpm·tpm / spend / embedding 缓存） |
 | 虚拟 Key + 预算 | `enable_virtual_keys` / `virtual_keys` / `master_key`；**流式 SSE 收齐 usage 后扣费** |
 | 工具调用透传 | OpenAI `tools`/`tool_calls` ↔ Anthropic / Bedrock / Gemini |
+| 请求指标日志 | `logging.log_statistics` → `ai.router.meta` / `ai.router.usage`（file-log / http-log） |
 
 ## 安装
 
@@ -272,6 +273,37 @@ curl -H "Authorization: Bearer sk-team-a" http://kong:8000/v1/models
 | `enable_virtual_keys` | `false` | 启用虚拟 Key 鉴权与预算 |
 | `master_key` | — | 主 Key |
 | `virtual_keys` | `[]` | 虚拟 Key 列表 |
+| `logging.log_statistics` | `true` | 为 true 时把本次请求指标写入 Kong log 序列化对象（file-log / http-log / prometheus） |
+
+### 请求指标（file-log）
+
+同路由挂 `file-log`（或 `http-log`）。`log_statistics` 默认为 `true`；若要关闭：
+
+```yaml
+config:
+  logging:
+    log_statistics: false
+```
+
+每条日志会出现：
+
+| 字段 | 说明 |
+|------|------|
+| `ai.router.meta.plugin_id` | 插件实例 ID |
+| `ai.router.meta.provider_name` | 厂商 |
+| `ai.router.meta.request_model` | 客户端原始 model（如 `auto`） |
+| `ai.router.meta.response_model` | 实际别名 |
+| `ai.router.meta.upstream_model` | 上游真实模型 |
+| `ai.router.meta.deployment` | 部署 ID |
+| `ai.router.meta.attempts` | 尝试次数 |
+| `ai.router.meta.strategy` | 路由策略 |
+| `ai.router.meta.llm_latency` | 上游/端到端延迟（ms） |
+| `ai.router.meta.success` / `status` / `stream` / `endpoint` | 结果与端点 |
+| `ai.router.meta.fallback_reason` / `semantic_*` / `key_name` | 可选诊断 |
+| `ai.router.usage.prompt_tokens` / `completion_tokens` / `total_tokens` | token |
+| `ai.router.usage.cost` | 按部署单价估算费用 |
+| `ai.router.usage.time_per_token` | `llm_latency / completion_tokens` |
+| `ai.router.usage.spend` / `max_budget` | 虚拟 Key 预算（若启用） |
 
 ### `model_list[]`
 

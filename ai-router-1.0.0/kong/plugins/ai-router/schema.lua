@@ -291,6 +291,20 @@ local virtual_key = {
 }
 
 
+local logging_schema = {
+  type = "record",
+  description = "将请求指标写入 Kong log 插件（file-log / http-log）可序列化对象。",
+  fields = {
+    { log_statistics = {
+        description = "为 true 时写入 ai.router.meta / ai.router.usage（供 file-log / prometheus 等输出）。",
+        type = "boolean",
+        default = true,
+        required = true,
+    }},
+  },
+}
+
+
 return {
   name = "ai-router",
   fields = {
@@ -468,6 +482,7 @@ return {
               default = true,
               required = true,
           }},
+          { logging = logging_schema },
           { state_backend = {
               description = "状态后端：redis（跨节点，默认）或 local（共享内存）。",
               type = "string",

@@ -26,6 +26,9 @@ _G.kong = {
     warn = function() end,
     notice = function() end,
     info = function() end,
+    debug = function() end,
+    err = function() end,
+    set_serialize_value = function() end,
   },
 }
 
@@ -373,6 +376,84 @@ do
 
   p, m = providers.parse_model("groq/llama3")
   assert_eq(p, "openai", "groq compat adapter")
+end
+
+
+-- ---- analytics / file-log serialize ----
+do
+  local analytics = require "kong.plugins.ai-router.analytics"
+  local serialized = {}
+  kong.log.set_serialize_value = function(key, value)
+    serialized[key] = value
+  end
+
+  assert_false(analytics.enabled({}), "disabled without logging")
+  assert_false(analytics.enabled({ logging = { log_statistics = false } }), "explicitly disabled")
+  assert_true(analytics.enabled({ logging = { log_statistics = true } }), "enabled")
+
+  ngx.ctx = {}
+  serialized = {}
+  local conf_off = { logging = { log_statistics = false } }
+  analytics.start(conf_off)
+  analytics.record_success(conf_off, {
+    status = 200, model = "gpt-4o", prompt_tokens = 1, completion_tokens = 2,
+  })
+  assert_false(analytics.serialize(conf_off), "no serialize when off")
+  assert_eq(serialized["ai.router.meta"], nil, "no meta when off")
+
+  ngx.ctx = {}
+  serialized = {}
+  local conf_on = {
+    logging = { log_statistics = true },
+    __plugin_id = "pid-1",
+  }
+  analytics.start(conf_on)
+  analytics.record_success(conf_on, {
+    status = 200,
+    provider = "openai",
+    request_model = "auto",
+    model = "gpt-4o",
+    upstream_model = "gpt-4o-2024",
+    deployment = "dep-1",
+    attempts = 2,
+    strategy = "simple-shuffle",
+    endpoint = "chat",
+    stream = false,
+    latency = 150,
+    prompt_tokens = 10,
+    completion_tokens = 5,
+    cost = 0.05,
+    spend = 1.2,
+    max_budget = 10,
+  })
+  assert_true(analytics.serialize(conf_on), "serialize ok")
+  local meta = serialized["ai.router.meta"]
+  local usage = serialized["ai.router.usage"]
+  assert_true(type(meta) == "table", "meta table")
+  assert_true(type(usage) == "table", "usage table")
+  assert_eq(meta.plugin_id, "pid-1", "plugin_id")
+  assert_eq(meta.provider_name, "openai", "provider")
+  assert_eq(meta.request_model, "auto", "request_model")
+  assert_eq(meta.response_model, "gpt-4o", "response_model")
+  assert_eq(meta.upstream_model, "gpt-4o-2024", "upstream_model")
+  assert_eq(meta.deployment, "dep-1", "deployment")
+  assert_eq(meta.attempts, 2, "attempts")
+  assert_eq(meta.llm_latency, 150, "llm_latency meta")
+  assert_eq(meta.success, true, "success")
+  assert_eq(usage.prompt_tokens, 10, "prompt_tokens")
+  assert_eq(usage.completion_tokens, 5, "completion_tokens")
+  assert_eq(usage.total_tokens, 15, "total_tokens")
+  assert_eq(usage.llm_latency, 150, "llm_latency usage")
+  assert_true(math.abs((usage.time_per_token or 0) - 30) < 1e-9, "time_per_token")
+  assert_eq(usage.cost, 0.05, "cost")
+
+  -- log phase re-serialize is idempotent
+  serialized = {}
+  assert_true(analytics.log(conf_on), "log phase")
+  assert_eq(serialized["ai.router.usage"].total_tokens, 15, "log phase usage")
+
+  ngx.ctx = {}
+  serialized = {}
 end
 
 

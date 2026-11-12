@@ -7,6 +7,7 @@ local models    = require "kong.plugins.ai-router.models"
 local virtual_keys = require "kong.plugins.ai-router.virtual_keys"
 local semantic  = require "kong.plugins.ai-router.semantic"
 local errors    = require "kong.plugins.ai-router.errors"
+local analytics = require "kong.plugins.ai-router.analytics"
 
 local ngx = ngx
 local kong = kong
@@ -413,6 +414,7 @@ local function try_deployment(conf, dep, endpoint, body, client_model, stream, v
         upstream_model = req.upstream_model,
         prompt_tokens = pt,
         completion_tokens = ct,
+        latency = latency,
         dep = dep,
         rpm_reserved = rpm_reserved,
       }
@@ -498,6 +500,8 @@ function _M.execute(conf)
 
   -- /v1/models
   if conf.enable_models_endpoint and models.matches(path, method) then
+    analytics.start(conf)
+    analytics.record(conf, { endpoint = "models", stream = false })
     return models.handle(conf)
   end
 
@@ -509,19 +513,35 @@ function _M.execute(conf)
     return
   end
 
+  analytics.start(conf)
+
   -- Virtual key auth
   local vk, verr, vstatus = virtual_keys.authenticate(conf)
   if conf.enable_virtual_keys then
     if verr then
+      analytics.record_failure(conf, {
+        status = vstatus or 401,
+        request_model = nil,
+      })
+      analytics.serialize(conf)
       return kong.response.exit(vstatus or 401, {
         error = { message = verr, type = "authentication_error" },
       })
     end
+    analytics.record_vk(conf, vk)
     local ok_budget, spend, max_budget = virtual_keys.check_budget(conf, vk)
     if not ok_budget then
       kong.log.warn(log_prefix(),
         " budget exceeded spend=", tostring(spend),
         " max_budget=", tostring(max_budget))
+      analytics.record_failure(conf, {
+        status = 429,
+        spend = spend,
+        max_budget = max_budget,
+        key_name = vk and (vk.name or "default") or nil,
+      })
+      analytics.record_vk(conf, vk, spend, max_budget)
+      analytics.serialize(conf)
       return kong.response.exit(429, {
         error = {
           message = "Budget exceeded: spend=" .. tostring(spend)
@@ -546,6 +566,8 @@ function _M.execute(conf)
     kong.log.warn(log_prefix(),
       " max_inflight exceeded inflight=", tostring(inflight_n),
       " max=", tostring(conf.max_inflight))
+    analytics.record_failure(conf, { status = 429 })
+    analytics.serialize(conf)
     return kong.response.exit(429, {
       error = {
         message = "Too many in-flight AI requests: " .. tostring(inflight_n)
@@ -561,11 +583,13 @@ function _M.execute(conf)
 
   local function exit(status, body_or_json, headers)
     release_inflight()
+    analytics.serialize(conf)
     return kong.response.exit(status, body_or_json, headers)
   end
 
   local body, _, err = parse_body()
   if not body then
+    analytics.record_failure(conf, { status = 400 })
     return exit(400, {
       error = { message = err or "invalid JSON body", type = "invalid_request_error" },
     })
@@ -575,6 +599,7 @@ function _M.execute(conf)
 
   local client_model = body.model
   if type(client_model) ~= "string" or client_model == "" then
+    analytics.record_failure(conf, { status = 400 })
     return exit(400, {
       error = { message = "missing model", type = "invalid_request_error" },
     })
@@ -589,6 +614,11 @@ function _M.execute(conf)
     local prompt_text = semantic.extract_prompt(body,
       (conf.semantic and conf.semantic.max_prompt_chars) or 4000)
     if prompt_text == "" then
+      analytics.record_failure(conf, {
+        status = 400,
+        request_model = requested_model,
+        model = client_model,
+      })
       return exit(400, {
         error = {
           message = "semantic routing requires a non-empty prompt/messages",
@@ -607,6 +637,11 @@ function _M.execute(conf)
       local resolved, score, serr, pvec, pref =
         semantic.resolve_model(conf, conf.model_list, prompt_text, allow_fn)
       if not resolved then
+        analytics.record_failure(conf, {
+          status = 404,
+          request_model = requested_model,
+          model = client_model,
+        })
         return exit(404, {
           error = {
             message = serr or "semantic routing found no matching model",
@@ -633,6 +668,11 @@ function _M.execute(conf)
   end
 
   if conf.enable_virtual_keys and not virtual_keys.model_allowed(vk, client_model) then
+    analytics.record_failure(conf, {
+      status = 403,
+      request_model = requested_model,
+      model = client_model,
+    })
     return exit(403, {
       error = {
         message = "model '" .. client_model .. "' not allowed for this API key",
@@ -644,6 +684,11 @@ function _M.execute(conf)
 
   local groups = router.index_model_list(conf.model_list)
   if not groups[client_model] then
+    analytics.record_failure(conf, {
+      status = 404,
+      request_model = requested_model,
+      model = client_model,
+    })
     return exit(404, {
       error = {
         message = "model '" .. client_model .. "' not found in model_list",
@@ -655,6 +700,15 @@ function _M.execute(conf)
 
   local endpoint = detect_endpoint(path)
   local stream = body.stream == true
+  analytics.record(conf, {
+    request_model = requested_model,
+    model = client_model,
+    endpoint = endpoint,
+    stream = stream,
+    strategy = use_semantic and "semantic" or conf.routing_strategy,
+    semantic_score = semantic_score,
+    semantic_model = requested_model ~= client_model and requested_model or nil,
+  })
   local fb_map = router.fallback_map(conf)
   local cw_map = router.context_window_fallback_map(conf)
   local cp_map = router.content_policy_fallback_map(conf)
@@ -726,13 +780,38 @@ function _M.execute(conf)
           { rpm_reserved = rpm_reserved })
 
         if result and result.streamed then
+          analytics.record_success(conf, {
+            status = result.status or 200,
+            provider = result.provider,
+            request_model = requested_model,
+            model = model_name,
+            upstream_model = result.upstream_model,
+            deployment = dep_id,
+            attempts = attempts,
+            strategy = use_semantic and "semantic" or conf.routing_strategy,
+            semantic_score = semantic_score,
+            semantic_model = requested_model ~= client_model and requested_model or nil,
+            fallback_reason = fallback_reason,
+            endpoint = endpoint,
+            stream = true,
+            latency = result.latency,
+            prompt_tokens = result.prompt_tokens,
+            completion_tokens = result.completion_tokens,
+            dep = result.dep or dep,
+            vk = vk,
+          })
+          analytics.record_vk(conf, vk)
+          analytics.serialize(conf)
           release_inflight()
           return ngx.exit(result.status or ngx.HTTP_OK)
         end
 
         if result and result.status and result.status >= 200 and result.status < 300 then
           local spend, max_budget
+          local cost
           if conf.enable_virtual_keys then
+            cost = virtual_keys.charge_amount(vk, result.dep or dep,
+              result.prompt_tokens, result.completion_tokens)
             local _, charged_spend = virtual_keys.charge(conf, vk, result.dep or dep,
               result.prompt_tokens, result.completion_tokens)
             spend = charged_spend
@@ -742,7 +821,34 @@ function _M.execute(conf)
                 spend = state.get_spend(conf, vk.key)
               end
             end
+          else
+            cost = virtual_keys.estimate_cost(result.dep or dep,
+              result.prompt_tokens, result.completion_tokens)
           end
+          analytics.record_success(conf, {
+            status = result.status,
+            provider = result.provider,
+            request_model = requested_model,
+            model = model_name,
+            upstream_model = result.upstream_model,
+            deployment = dep_id,
+            attempts = attempts,
+            strategy = use_semantic and "semantic" or conf.routing_strategy,
+            semantic_score = semantic_score,
+            semantic_model = requested_model ~= client_model and requested_model or nil,
+            fallback_reason = fallback_reason,
+            endpoint = endpoint,
+            stream = false,
+            latency = result.latency,
+            prompt_tokens = result.prompt_tokens,
+            completion_tokens = result.completion_tokens,
+            cost = cost,
+            spend = spend,
+            max_budget = max_budget,
+            dep = result.dep or dep,
+            vk = vk,
+          })
+          analytics.record_vk(conf, vk, spend, max_budget)
           local headers = merge_headers(
             http_client.filter_response_headers(result.headers),
             diag_headers(conf, {
@@ -873,6 +979,22 @@ function _M.execute(conf)
             last_status = out_status,
             reason = last_reason,
           })
+          analytics.record_failure(conf, {
+            status = out_status,
+            provider = result.provider,
+            request_model = requested_model,
+            model = model_name,
+            upstream_model = result.upstream_model,
+            deployment = dep_id,
+            attempts = attempts,
+            strategy = use_semantic and "semantic" or conf.routing_strategy,
+            semantic_score = semantic_score,
+            semantic_model = requested_model ~= client_model and requested_model or nil,
+            fallback_reason = fallback_reason,
+            endpoint = endpoint,
+            stream = stream,
+            latency = result.latency,
+          })
           local headers = merge_headers(
             http_client.filter_response_headers(result.headers),
             diag_headers(conf, {
@@ -927,6 +1049,22 @@ function _M.execute(conf)
       last_status = last_status,
       reason = last_reason or extract_error_message(last_body) or message,
     })
+    analytics.record_failure(conf, {
+      status = out_status,
+      provider = last_provider,
+      request_model = requested_model,
+      model = client_model,
+      upstream_model = last_upstream_model,
+      deployment = last_deployment,
+      attempts = attempts,
+      strategy = use_semantic and "semantic" or conf.routing_strategy,
+      semantic_score = semantic_score,
+      semantic_model = requested_model ~= client_model and requested_model or nil,
+      fallback_reason = fb,
+      endpoint = endpoint,
+      stream = stream,
+      latency = last_latency,
+    })
     local headers = merge_headers(
       http_client.filter_response_headers(last_headers),
       diag_headers(conf, {
@@ -950,6 +1088,22 @@ function _M.execute(conf)
     fallback_reason = fb,
     last_status = last_status,
     reason = last_reason or message,
+  })
+  analytics.record_failure(conf, {
+    status = 503,
+    provider = last_provider,
+    request_model = requested_model,
+    model = client_model,
+    upstream_model = last_upstream_model,
+    deployment = last_deployment,
+    attempts = attempts,
+    strategy = use_semantic and "semantic" or conf.routing_strategy,
+    semantic_score = semantic_score,
+    semantic_model = requested_model ~= client_model and requested_model or nil,
+    fallback_reason = fb,
+    endpoint = endpoint,
+    stream = stream,
+    latency = last_latency,
   })
   return exit(503, http_client.error_json(503, message, client_model),
     merge_headers(
